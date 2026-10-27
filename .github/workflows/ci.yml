@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     name: Lint and build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
@@ -30,7 +30,7 @@ jobs:
 
   test:
     name: Tests (${{ matrix.database }}, ${{ matrix.storage }} storage)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

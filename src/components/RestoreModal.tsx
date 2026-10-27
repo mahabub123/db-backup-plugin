@@ -86,6 +86,7 @@ export const RestoreModal = ({
               Type <code>{RESTORE_CONFIRMATION}</code> to restore now.
             </span>
             <input
+              aria-label={`Type ${RESTORE_CONFIRMATION} to restore now.`}
               autoComplete="off"
               className="input"
               onChange={(event) => setTyped(event.target.value)}

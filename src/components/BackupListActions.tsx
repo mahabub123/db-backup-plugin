@@ -144,6 +144,7 @@ export const BackupListActions = ({ backupsSlug = 'backups' }: { backupsSlug?: s
       </Button>
       <label style={{ alignItems: 'center', display: 'flex', gap: 6 }}>
         <input
+          aria-label="Include uploaded files"
           checked={includeMedia}
           disabled={busy !== null}
           onChange={(event) => setIncludeMedia(event.target.checked)}

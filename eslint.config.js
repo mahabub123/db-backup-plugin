@@ -30,6 +30,13 @@ export default [
     },
   },
   {
+    // The `payload backup:*` commands talk to the user through the terminal.
+    files: ['src/bin/**'],
+    rules: {
+      'no-console': 'off',
+    },
+  },
+  {
     languageOptions: {
       parserOptions: {
         sourceType: 'module',
