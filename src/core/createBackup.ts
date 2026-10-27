@@ -1,4 +1,4 @@
-import type { Payload, PayloadRequest, TypedUser } from 'payload'
+import type { Payload, PayloadRequest, TypedUser, Where } from 'payload'
 
 import crypto from 'crypto'
 import fs from 'fs'
@@ -18,6 +18,7 @@ import type {
 import { createBackupFilename } from '../utilities/filename.js'
 import { getPackageVersions } from '../utilities/versions.js'
 import { getBackupCollections, getBackupGlobals, getMediaCollections } from './entities.js'
+import { withLock } from './lock.js'
 import { copyFileToArchive, getArchiveMediaPath, getDocumentFiles } from './media.js'
 import { createNdjsonWriter } from './ndjson.js'
 import { applyRetention } from './retention.js'
@@ -58,6 +59,48 @@ export const sha256File = async (filePath: string): Promise<string> => {
   await pipeline(fs.createReadStream(filePath), hash)
   return hash.digest('hex')
 }
+
+type Row = Record<string, unknown>
+
+/**
+ * Reads every row in batches of `limit`. Each batch continues right after the
+ * last row of the previous one (`after`), instead of skipping a number of
+ * pages: that stays fast on large tables, and needs no count per batch.
+ */
+async function* readInBatches({
+  after,
+  find,
+  limit,
+}: {
+  after: (last: Row) => Where
+  find: (where?: Where) => Promise<Row[]>
+  limit: number
+}): AsyncGenerator<Row[]> {
+  let where: undefined | Where
+  for (;;) {
+    const rows = await find(where)
+    if (rows.length) {
+      yield rows
+    }
+    if (rows.length < limit) {
+      return
+    }
+    where = after(rows[rows.length - 1])
+  }
+}
+
+/**
+ * Versions are exported oldest first, which a restore needs to set the
+ * `latest` flag right. The id breaks ties between equal timestamps.
+ */
+const VERSION_SORT = ['updatedAt', 'id']
+
+const afterVersion = (last: Row): Where => ({
+  or: [
+    { updatedAt: { greater_than: last.updatedAt } },
+    { and: [{ updatedAt: { equals: last.updatedAt } }, { id: { greater_than: last.id } }] },
+  ],
+})
 
 /**
  * Writes the full content of the site into `dir`:
@@ -115,18 +158,25 @@ export const writeBackupContents = async ({
       ? { collection: slug, files: 0, missing: [] as string[] }
       : null
 
-    for (let page = 1; ; page++) {
-      const result = await payload.db.find({
-        collection: slug,
-        joins: false,
-        limit: options.batchSize,
-        page,
-        pagination: true,
-        req,
-        sort: 'id',
-      })
+    const batches = readInBatches({
+      after: (last) => ({ id: { greater_than: last.id } }),
+      find: async (where) =>
+        (
+          await payload.db.find({
+            collection: slug,
+            joins: false,
+            limit: options.batchSize,
+            pagination: false,
+            req,
+            sort: 'id',
+            where,
+          })
+        ).docs,
+      limit: options.batchSize,
+    })
 
-      for (const doc of result.docs as Record<string, unknown>[]) {
+    for await (const batch of batches) {
+      for (const doc of batch) {
         await writer.write(doc)
 
         if (media) {
@@ -146,10 +196,6 @@ export const writeBackupContents = async ({
           }
         }
       }
-
-      if (!result.hasNextPage) {
-        break
-      }
     }
 
     const count = await writer.close()
@@ -157,20 +203,24 @@ export const writeBackupContents = async ({
 
     if (options.includeVersions && collection.versions) {
       const versionWriter = createNdjsonWriter(path.join(dir, 'versions', `${slug}.ndjson`))
-      for (let page = 1; ; page++) {
-        const result = await payload.db.findVersions({
-          collection: slug,
-          limit: options.batchSize,
-          page,
-          pagination: true,
-          req,
-          sort: 'updatedAt',
-        })
-        for (const version of result.docs) {
+      const batches = readInBatches({
+        after: afterVersion,
+        find: async (where) =>
+          (
+            await payload.db.findVersions({
+              collection: slug,
+              limit: options.batchSize,
+              pagination: false,
+              req,
+              sort: VERSION_SORT,
+              where,
+            })
+          ).docs,
+        limit: options.batchSize,
+      })
+      for await (const batch of batches) {
+        for (const version of batch) {
           await versionWriter.write(version)
-        }
-        if (!result.hasNextPage) {
-          break
         }
       }
       versions = await versionWriter.close()
@@ -199,20 +249,24 @@ export const writeBackupContents = async ({
     let versions = 0
     if (options.includeVersions && global.versions) {
       const versionWriter = createNdjsonWriter(path.join(dir, 'global-versions', `${slug}.ndjson`))
-      for (let page = 1; ; page++) {
-        const result = await payload.db.findGlobalVersions({
-          global: slug,
-          limit: options.batchSize,
-          page,
-          pagination: true,
-          req,
-          sort: 'updatedAt',
-        })
-        for (const version of result.docs) {
+      const batches = readInBatches({
+        after: afterVersion,
+        find: async (where) =>
+          (
+            await payload.db.findGlobalVersions({
+              global: slug,
+              limit: options.batchSize,
+              pagination: false,
+              req,
+              sort: VERSION_SORT,
+              where,
+            })
+          ).docs,
+        limit: options.batchSize,
+      })
+      for await (const batch of batches) {
+        for (const version of batch) {
           await versionWriter.write(version)
-        }
-        if (!result.hasNextPage) {
-          break
         }
       }
       versions = await versionWriter.close()
@@ -230,8 +284,13 @@ export const writeBackupContents = async ({
  * Creates a complete backup of the site (database + uploaded files), stores
  * it with the configured storage adapter and records it in the backups
  * collection. Failed backups are recorded too, with the error message.
+ * Throws a 409 APIError while another backup or restore is running.
  */
-export const createBackup = async ({
+export const createBackup = (args: CreateBackupArgs): Promise<BackupRecord> =>
+  withLock('backup', () => takeBackup(args))
+
+/** `createBackup` without the lock, for the safety backup a restore takes while holding it. */
+export const takeBackup = async ({
   type = 'manual',
   frequencies,
   includeMedia = true,

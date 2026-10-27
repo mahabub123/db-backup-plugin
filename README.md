@@ -259,7 +259,7 @@ backupPlugin({
   media: true,               // or { collections: ['media'], restoreFile }
   retention: { maxBackups: 14, maxAgeDays: 30 },   // manual/imported/before-restore backups only
   safetyBackupBeforeRestore: true,
-  useTransaction: true,      // see "Large MongoDB databases"
+  useTransaction: undefined, // MongoDB only, see "Large MongoDB databases"
   slug: 'backups',
   settingsSlug: 'backup-settings',
   adminGroup: 'System',
@@ -331,19 +331,22 @@ While a restore writes to the database, `req.context.payloadPluginBackupRestore`
 ## How a restore works
 
 1. The archive is downloaded, its SHA-256 checksum verified and extracted.
-2. A safety backup of the current state is taken (`type: pre-restore`).
+2. A safety backup of the current state is taken (`type: pre-restore`). It also shows up in the list, so a restore can be undone by restoring it.
 3. In **one database transaction**: every backed-up collection is emptied and refilled with the original ids, versions are rebuilt oldest-first, and globals are overwritten.
    - Postgres/SQLite: foreign-key checks are postponed until the end of the transaction so documents can reference each other in any order. They are then verified all at once and the constraints are put back exactly as Payload created them. Serial id sequences are moved past the restored ids.
 4. After the commit, uploaded files are written back.
 
 If anything fails in step 3, the transaction is rolled back and the database is left untouched.
 
+Only one backup or restore runs at a time. Starting another one meanwhile answers `409` (*already in progress*), a restore waits for backups running on other server instances, and the schedule simply checks again a few minutes later. The **Backup Settings** are never part of a backup, so a restore can't change or turn off your schedule.
+
 ## Good to know
 
 - **Restore into the same database engine.** MongoDB ObjectIDs and SQL ids aren't interchangeable, and imports from another engine are refused. Moving between servers on the same engine (local → production, Neon → RDS, Atlas → self-hosted) works.
 - **Same schema.** Restore into a site running the same collections and fields as when the backup was taken. Run your migrations first. Collections or globals that no longer exist are skipped and reported.
 - **Users are restored too.** Passwords revert to what they were at backup time, and you may be signed out.
-- **Large MongoDB databases.** MongoDB aborts transactions after 60 seconds. For very large databases set `useTransaction: false`, which only affects MongoDB. SQL databases always use a transaction.
+- **Large MongoDB databases.** MongoDB ends transactions after 60 seconds. A restore that takes longer (in our tests, 20,000 posts with 40,000 versions did) is rolled back by MongoDB and then automatically run again, committing every `batchSize` documents; if that second run fails halfway, restore the safety backup taken just before. Set `useTransaction: true` to only ever restore all at once, or `false` to skip the first attempt. Postgres and SQLite always restore in one transaction, however long it takes.
+- **Disk space.** Archives are built and unpacked in `tempDir` (the system temp folder by default) before they are uploaded or restored. Leave free space for about twice the size of your database plus uploads, or point `tempDir` at a larger disk.
 - **Serverless timeouts.** `run` and `restore` work inside the request. On platforms with short function timeouts, use `schedule` with a jobs runner, or call `createBackup` from a script.
 - Backups contain password hashes and all private content. Restrict `access`, keep buckets private and treat downloaded archives as secrets.
 - A backup you have never restored is not a verified backup. Test restoring into a staging site regularly.
@@ -361,6 +364,9 @@ DATABASE_ADAPTER=sqlite DATABASE_URL=file:/tmp/backup-test.db pnpm test:int
 
 # against any S3-compatible server (MinIO, moto, a real bucket)
 S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=test S3_ACCESS_KEY_ID=x S3_SECRET_ACCESS_KEY=y pnpm test:int
+
+# a large generated site: backs up, loses half, restores, compares every post and version (takes minutes)
+SCALE_DOCS=20000 pnpm vitest run dev/scale.test.ts
 
 pnpm build                         # compiles src/ to dist/ for publishing
 ```

@@ -140,11 +140,15 @@ export type BackupPluginConfig = {
   /** Directory used while building and extracting archives. @default os.tmpdir() */
   tempDir?: string
   /**
-   * Run the database part of a restore in a single transaction so a failed
-   * restore leaves the database untouched. Turn off for very large MongoDB
-   * databases that exceed MongoDB's 60 second transaction limit.
+   * MongoDB only (SQL databases always restore in a transaction). Restores run
+   * in a single transaction, so a failed restore leaves the database
+   * untouched, but MongoDB ends transactions after 60 seconds.
    *
-   * @default true
+   * - unset (default): one transaction; if MongoDB ends it for running too
+   *   long, nothing has changed and the restore runs again, committing every
+   *   `batchSize` documents
+   * - `true`: one transaction; large restores fail instead
+   * - `false`: commit every `batchSize` documents right away
    */
   useTransaction?: boolean
 }
@@ -198,7 +202,7 @@ export type SanitizedBackupPluginConfig = {
   slug: string
   storage: BackupStorageAdapter
   tempDir: string
-  useTransaction: boolean
+  useTransaction?: boolean
 }
 
 export type BackupManifest = {

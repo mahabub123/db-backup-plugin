@@ -49,7 +49,10 @@ export const checkCompatibility = ({
   }
 
   const globals = new Set(getBackupGlobals(payload, options).map(({ slug }) => slug))
-  const missingGlobals = manifest.globals.map(({ slug }) => slug).filter((slug) => !globals.has(slug))
+  // Archives made by 1.0.x include the Backup Settings, which are never restored.
+  const missingGlobals = manifest.globals
+    .map(({ slug }) => slug)
+    .filter((slug) => !globals.has(slug) && slug !== options.settingsSlug)
   if (missingGlobals.length) {
     warnings.push(`Not restored because this site has no such global: ${missingGlobals.join(', ')}.`)
   }

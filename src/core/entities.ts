@@ -30,10 +30,18 @@ export const getBackupCollections = (
     options.collections,
   )
 
+/**
+ * The plugin's own Backup Settings are left out: restoring an older backup must
+ * not change (or turn off) the schedule that protects the site.
+ */
 export const getBackupGlobals = (
   payload: Payload,
   options: SanitizedBackupPluginConfig,
-): SanitizedGlobalConfig[] => filterBySlug(payload.config.globals, options.globals)
+): SanitizedGlobalConfig[] =>
+  filterBySlug(
+    payload.config.globals.filter(({ slug }) => slug !== options.settingsSlug),
+    options.globals,
+  )
 
 export const getMediaCollections = (
   payload: Payload,

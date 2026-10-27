@@ -4,6 +4,7 @@ import type { BackupFrequency, SanitizedBackupPluginConfig } from '../types.js'
 import type { BackupRecord } from './createBackup.js'
 
 import { createBackup } from './createBackup.js'
+import { getRunningTask } from './lock.js'
 
 export const FREQUENCIES: BackupFrequency[] = ['daily', 'weekly', 'monthly']
 
@@ -35,7 +36,7 @@ const DAY = 24 * 60 * 60 * 1000
 /** Don't hammer a failing database or bucket: wait this long before retrying. */
 const RETRY_AFTER = 60 * 60 * 1000
 /** A backup still "running" after this long is assumed to have crashed. */
-const STALE_RUNNING = 6 * 60 * 60 * 1000
+export const STALE_RUNNING = 6 * 60 * 60 * 1000
 
 export const parseTime = (time?: null | string): { hour: number; minute: number } => {
   const match = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec((time ?? '').trim())
@@ -282,6 +283,11 @@ export const runScheduledBackups = async ({
 
   if (!settings.enabled) {
     return { deleted: 0, frequencies: [], reason: 'Automatic backups are turned off.' }
+  }
+
+  const task = getRunningTask()
+  if (task) {
+    return { deleted: 0, frequencies: [], reason: `A ${task} is in progress; checking again later.` }
   }
 
   const running = await findLatest(payload, options, { status: { equals: 'running' } })

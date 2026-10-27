@@ -25,6 +25,10 @@ export const getPackageVersions = () => {
     } catch {
       // payload could not be resolved from here; the version is informational only
     }
+    if (payloadVersion === 'unknown') {
+      // Bundlers (Next.js) rewrite module resolution; the app's own install is the next best guess.
+      payloadVersion = readVersion(path.join(process.cwd(), 'node_modules', 'payload', 'package.json'))
+    }
     cached = {
       payloadVersion,
       // src/utilities or dist/utilities -> package root

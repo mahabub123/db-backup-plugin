@@ -123,7 +123,7 @@ export const backupPlugin =
       settingsSlug: pluginOptions.settingsSlug ?? 'backup-settings',
       storage: pluginOptions.storage ?? localStorageAdapter(),
       tempDir: pluginOptions.tempDir ?? os.tmpdir(),
-      useTransaction: pluginOptions.useTransaction ?? true,
+      useTransaction: pluginOptions.useTransaction,
     }
 
     // The collection and global are added even when disabled so the database

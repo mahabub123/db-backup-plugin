@@ -17,9 +17,10 @@ import type { BackupManifest, SanitizedBackupPluginConfig } from '../types.js'
 import type { BackupRecord } from './createBackup.js'
 
 import { checkCompatibility } from './compatibility.js'
-import { createBackup, sha256File } from './createBackup.js'
+import { sha256File, takeBackup } from './createBackup.js'
 import { deferForeignKeys, getDatabaseKind, resetSequences, restoreForeignKeys } from './database.js'
 import { getBackupCollections, getBackupGlobals, getMediaCollections } from './entities.js'
+import { withLock } from './lock.js'
 import {
   copyFileToStaticDir,
   fileExists,
@@ -28,6 +29,7 @@ import {
   isLocalUploadCollection,
 } from './media.js'
 import { readNdjson } from './ndjson.js'
+import { STALE_RUNNING } from './schedule.js'
 import { assertSameStorage } from './storageCheck.js'
 
 /** Set on `req.context` while a restore writes to the database. */
@@ -87,12 +89,15 @@ const readRestorableManifest = async ({
 }
 
 const restoreDatabase = async ({
+  afterWrite,
   dir,
   manifest,
   options,
   payload,
   req,
 }: {
+  /** Called after each document or version is written. */
+  afterWrite: () => Promise<void>
   dir: string
   manifest: BackupManifest
   options: SanitizedBackupPluginConfig
@@ -130,6 +135,7 @@ const restoreDatabase = async ({
           req,
           returning: false,
         })
+        await afterWrite()
         count++
       }
     }
@@ -152,6 +158,7 @@ const restoreDatabase = async ({
           updatedAt: version.updatedAt,
           versionData: withoutID(version.version),
         })
+        await afterWrite()
         versions++
       }
     }
@@ -162,7 +169,9 @@ const restoreDatabase = async ({
   for (const entry of manifest.globals) {
     const global = globals.get(entry.slug)
     if (!global) {
-      summary.skipped.push(entry.slug)
+      if (entry.slug !== options.settingsSlug) {
+        summary.skipped.push(entry.slug)
+      }
       continue
     }
 
@@ -195,6 +204,7 @@ const restoreDatabase = async ({
           updatedAt: version.updatedAt,
           versionData: withoutID(version.version),
         })
+        await afterWrite()
       }
     }
   }
@@ -257,6 +267,25 @@ const restoreMedia = async ({
 }
 
 /**
+ * MongoDB ends a transaction that runs longer than 60 seconds
+ * (`transactionLifetimeLimitSeconds`); everything it wrote is discarded.
+ */
+const isTransactionTimeout = (error: unknown): boolean => {
+  const { code, codeName, message } = (error ?? {}) as {
+    code?: number
+    codeName?: string
+    message?: string
+  }
+  return (
+    code === 251 ||
+    code === 290 ||
+    codeName === 'NoSuchTransaction' ||
+    codeName === 'TransactionExceededLifetimeLimitSeconds' ||
+    /Transaction .* has been aborted/.test(message ?? '')
+  )
+}
+
+/**
  * Replaces the content of the site with the content of an extracted archive.
  * The database part runs in one transaction (when the adapter supports it),
  * so a failing restore leaves the database as it was. Files are written after
@@ -274,26 +303,61 @@ export const restoreFromDirectory = async ({
   user?: null | TypedUser
 }): Promise<RestoreSummary> => {
   const manifest = await readRestorableManifest({ dir, options, payload })
-  const req = await createLocalReq(
-    { context: { [RESTORE_CONTEXT_KEY]: true }, user: user ?? undefined },
-    payload,
-  )
+  const isMongo = getDatabaseKind(payload) === 'mongodb'
 
-  // Foreign keys can only be postponed inside a transaction on SQL databases.
-  const useTransaction = options.useTransaction || getDatabaseKind(payload) !== 'mongodb'
-  const shouldCommit = useTransaction ? await initTransaction(req) : false
+  /**
+   * `single`: one transaction for the whole restore, all or nothing.
+   * `batches`: commit every `batchSize` writes, for MongoDB databases too large
+   * for one transaction. Much faster than committing every write on its own.
+   */
+  const restoreOnce = async (mode: 'batches' | 'single'): Promise<RestoreSummary> => {
+    const req = await createLocalReq(
+      { context: { [RESTORE_CONTEXT_KEY]: true }, user: user ?? undefined },
+      payload,
+    )
+    let open = await initTransaction(req)
+    let writes = 0
+    const afterWrite = async () => {
+      if (mode === 'batches' && open && ++writes % options.batchSize === 0) {
+        await commitTransaction(req)
+        open = await initTransaction(req)
+      }
+    }
+
+    try {
+      const summary = await restoreDatabase({ afterWrite, dir, manifest, options, payload, req })
+      if (open) {
+        await commitTransaction(req)
+      }
+      return summary
+    } catch (error) {
+      if (open) {
+        await killTransaction(req).catch(() => undefined)
+      }
+      throw error
+    }
+  }
 
   let summary: RestoreSummary
   try {
-    summary = await restoreDatabase({ dir, manifest, options, payload, req })
-    if (shouldCommit) {
-      await commitTransaction(req)
-    }
+    // Foreign keys can only be postponed inside a transaction on SQL databases.
+    summary = await restoreOnce(isMongo && options.useTransaction === false ? 'batches' : 'single')
   } catch (error) {
-    if (shouldCommit) {
-      await killTransaction(req)
+    if (!isMongo || options.useTransaction === false || !isTransactionTimeout(error)) {
+      throw error
     }
-    throw error
+    if (options.useTransaction === true) {
+      throw new Error(
+        'MongoDB ended the restore transaction because it ran longer than 60 seconds. Nothing was changed. Set `useTransaction: false` in the backup plugin options (or leave it unset) to restore large databases.',
+        { cause: error },
+      )
+    }
+    // The transaction was rolled back, so nothing changed yet. Restore again in
+    // smaller transactions; the safety backup taken before the restore can undo it.
+    payload.logger.warn(
+      '[payload-plugin-backup] MongoDB ended the restore transaction after 60 seconds (large database). Nothing was changed; restoring again in smaller transactions.',
+    )
+    summary = await restoreOnce('batches')
   }
 
   await restoreMedia({ dir, options, payload, summary })
@@ -324,8 +388,14 @@ export type RestoreBackupArgs = {
 /**
  * Restores a stored backup. Unless `safetyBackupBeforeRestore` is turned off,
  * the current state is backed up first, so the restore can be undone.
+ * Throws a 409 APIError while another backup or restore is running.
  */
-export const restoreBackup = async ({
+export const restoreBackup = (
+  args: RestoreBackupArgs,
+): Promise<{ safetyBackup?: BackupRecord; summary: RestoreSummary }> =>
+  withLock('restore', () => runRestore(args))
+
+const runRestore = async ({
   id,
   options,
   payload,
@@ -342,6 +412,29 @@ export const restoreBackup = async ({
     throw new Error(`Backup ${backup.filename} is not complete and cannot be restored.`)
   }
   assertSameStorage(backup, options)
+
+  // A backup running in another server process (e.g. a scheduled one) would
+  // capture a mix of old and restored content.
+  const {
+    docs: [running],
+  } = await payload.find({
+    collection: options.slug,
+    depth: 0,
+    limit: 1,
+    overrideAccess: true,
+    where: {
+      and: [
+        { status: { equals: 'running' } },
+        { startedAt: { greater_than: new Date(Date.now() - STALE_RUNNING).toISOString() } },
+      ],
+    },
+  })
+  if (running) {
+    throw new APIError(
+      `Backup ${String(running.filename)} is being taken right now. Restore when it has finished. If the server was restarted since it started, it was interrupted: delete it from the list and try again.`,
+      409,
+    )
+  }
 
   await fsp.mkdir(options.tempDir, { recursive: true })
   const workDir = await fsp.mkdtemp(path.join(options.tempDir, 'payload-restore-'))
@@ -363,7 +456,7 @@ export const restoreBackup = async ({
     await readRestorableManifest({ dir: dataDir, options, payload })
 
     const safetyBackup = options.safetyBackupBeforeRestore
-      ? await createBackup({
+      ? await takeBackup({
           type: 'pre-restore',
           includeMedia: Boolean(backup.includesMedia),
           options,

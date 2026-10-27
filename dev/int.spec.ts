@@ -5,7 +5,12 @@ import fs from 'fs/promises'
 import os from 'os'
 import path from 'path'
 import { createPayloadRequest, getPayload } from 'payload'
-import { createBackup, restoreBackup, runScheduledBackups } from 'payload-plugin-backup'
+import {
+  createBackup,
+  RESTORE_CONTEXT_KEY,
+  restoreBackup,
+  runScheduledBackups,
+} from 'payload-plugin-backup'
 import sharp from 'sharp'
 import * as tar from 'tar'
 import { fileURLToPath } from 'url'
@@ -88,6 +93,18 @@ const editArchive = async (
     await fs.writeFile(manifestPath, JSON.stringify(manifest))
     await tar.create({ cwd: path.join(dir, 'data'), file: path.join(dir, 'out.tar.gz'), gzip: true }, ['.'])
     return await fs.readFile(path.join(dir, 'out.tar.gz'))
+  } finally {
+    await fs.rm(dir, { force: true, recursive: true })
+  }
+}
+
+/** Text content of one file inside an archive. */
+const readArchiveFile = async (archive: Buffer, file: string): Promise<string> => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'backup-test-'))
+  try {
+    await fs.writeFile(path.join(dir, 'in.tar.gz'), archive)
+    await tar.extract({ cwd: dir, file: path.join(dir, 'in.tar.gz') })
+    return await fs.readFile(path.join(dir, file), 'utf8')
   } finally {
     await fs.rm(dir, { force: true, recursive: true })
   }
@@ -382,6 +399,122 @@ describe('payload-plugin-backup', () => {
     expect(docs[0].type).toBe('found')
     expect(docs[0].checksum).toBe(backup.checksum)
   })
+
+  test('keeps every version when many share the same timestamp', async () => {
+    const options = getOptions(payload)
+    const { batchSize } = options
+    const stamp = '2026-01-01T00:00:00.000Z'
+    await payload.db.deleteVersions({ globalSlug: 'site-settings', where: {} })
+    for (let i = 0; i < 9; i++) {
+      await payload.db.createGlobalVersion({
+        autosave: false,
+        createdAt: stamp,
+        globalSlug: 'site-settings',
+        updatedAt: stamp,
+        versionData: { siteName: { en: `Version ${i}` } } as any,
+      })
+    }
+
+    // Read a few versions at a time, so the export needs several pages.
+    options.batchSize = 2
+    try {
+      const backup = await createBackup(payload, { includeMedia: false, user })
+      const lines = (await readArchiveFile(await downloadArchive(backup.id), 'global-versions/site-settings.ndjson'))
+        .trim()
+        .split('\n')
+      const names = lines.map((line) => JSON.parse(line).version.siteName.en)
+      expect(names).toHaveLength(9)
+      expect(new Set(names).size).toBe(9)
+    } finally {
+      options.batchSize = batchSize
+    }
+  })
+
+  test('runs one backup or restore at a time', async () => {
+    const backup = await createBackup(payload, { includeMedia: false, user })
+
+    const restoring = restoreBackup(payload, backup.id, { user })
+    await expect(createBackup(payload, { includeMedia: false, user })).rejects.toThrow(
+      /restore is already in progress/,
+    )
+    await expect(restoreBackup(payload, backup.id, { user })).rejects.toThrow(
+      /restore is already in progress/,
+    )
+    await restoring
+
+    // Free again once the restore has finished.
+    expect((await createBackup(payload, { includeMedia: false, user })).status).toBe('completed')
+  })
+
+  test('restores again without a transaction when MongoDB ends it', async () => {
+    if (!payload.db.packageName?.includes('mongo')) {
+      return
+    }
+    const category = await payload.create({ collection: 'categories', data: { title: 'Before' } })
+    const backup = await createBackup(payload, { includeMedia: false, user })
+    await payload.update({ id: category.id, collection: 'categories', data: { title: 'After' } })
+
+    // What MongoDB answers once a transaction has run longer than 60 seconds.
+    const create = payload.db.create
+    let attempts = 0
+    let timeoutPending = false
+    payload.db.create = (async (args) => {
+      if (timeoutPending && args.req?.context?.[RESTORE_CONTEXT_KEY] && args.req.transactionID) {
+        timeoutPending = false
+        attempts++
+        throw Object.assign(new Error('Transaction with { txnNumber: 1 } has been aborted.'), {
+          code: 251,
+          codeName: 'NoSuchTransaction',
+        })
+      }
+      return create.call(payload.db, args)
+    }) as typeof create
+
+    const options = getOptions(payload)
+    try {
+      options.useTransaction = true
+      timeoutPending = true
+      await expect(restoreBackup(payload, backup.id, { user })).rejects.toThrow(/useTransaction: false/)
+      expect((await payload.findByID({ id: category.id, collection: 'categories' })).title).toBe('After')
+
+      options.useTransaction = undefined
+      timeoutPending = true
+      await restoreBackup(payload, backup.id, { user })
+    } finally {
+      payload.db.create = create
+      options.useTransaction = undefined
+    }
+    expect(attempts).toBe(2)
+    expect((await payload.findByID({ id: category.id, collection: 'categories' })).title).toBe('Before')
+
+    // `useTransaction: false` commits every few documents; everything still comes back.
+    await payload.update({ id: category.id, collection: 'categories', data: { title: 'After' } })
+    const { batchSize } = options
+    try {
+      options.useTransaction = false
+      options.batchSize = 2
+      await restoreBackup(payload, backup.id, { user })
+    } finally {
+      options.useTransaction = undefined
+      options.batchSize = batchSize
+    }
+    expect((await payload.findByID({ id: category.id, collection: 'categories' })).title).toBe('Before')
+    expect(await payload.count({ collection: 'users' })).toEqual({ totalDocs: 1 })
+  })
+
+  test('refuses to restore while another server is taking a backup', async () => {
+    const backup = await createBackup(payload, { includeMedia: false, user })
+    const running = await payload.create({
+      collection: 'backups',
+      data: { type: 'manual', filename: 'elsewhere.tar.gz', startedAt: new Date().toISOString(), status: 'running' },
+      overrideAccess: true,
+    })
+    try {
+      await expect(restoreBackup(payload, backup.id, { user })).rejects.toThrow(/being taken right now/)
+    } finally {
+      await payload.db.deleteOne({ collection: 'backups', where: { id: { equals: running.id } } })
+    }
+  })
 })
 
 describe('automatic backups', () => {
@@ -398,6 +531,13 @@ describe('automatic backups', () => {
 
   const run = (iso: string) =>
     runScheduledBackups({ now: new Date(iso), options: getOptions(payload), payload })
+
+  // Start from a clean slate, so the tests also pass on a database used before.
+  beforeAll(async () => {
+    const { defaults } = getOptions(payload).schedule
+    await payload.updateGlobal({ slug: 'backup-settings', data: defaults })
+    await payload.delete({ collection: 'backups', where: { type: { equals: 'scheduled' } } })
+  })
 
   test('does nothing while turned off', async () => {
     const result = await run('2026-11-01T03:05:00Z')
@@ -467,5 +607,19 @@ describe('automatic backups', () => {
     const response = await getEndpoint('/cron', 'get').handler(allowed)
     expect(response.status).toBe(200)
     expect((await response.json()).message).toBeTruthy()
+  })
+
+  test('waits while a restore runs, and a restore keeps the schedule', async () => {
+    const [backup] = await scheduled()
+    await payload.updateGlobal({ slug: 'backup-settings', data: { daily: { enabled: true, keep: 5 } } })
+
+    const restoring = restoreBackup(payload, backup.id, { user })
+    expect((await run('2026-11-09T03:05:00Z')).reason).toMatch(/restore is in progress/)
+    await restoring
+
+    // The backup was taken while daily backups kept 2; the settings changed since.
+    const settings = await payload.findGlobal({ slug: 'backup-settings' })
+    expect(settings.enabled).toBe(true)
+    expect(settings.daily?.keep).toBe(5)
   })
 })
