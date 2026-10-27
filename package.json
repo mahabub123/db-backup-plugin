@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Back up and restore an entire Payload CMS site (database, versions, globals and uploaded files) from the admin panel, the REST API or on a schedule.",
   "license": "MIT",
+  "author": "Md Mahabub Alam",
   "type": "module",
   "exports": {
     ".": {
@@ -40,6 +41,7 @@
     "generate:types": "pnpm dev:generate-types",
     "lint": "eslint",
     "lint:fix": "eslint ./src --fix",
+    "prepublishOnly": "pnpm clean && pnpm build",
     "test": "pnpm test:int && pnpm test:e2e",
     "test:e2e": "playwright test",
     "test:int": "vitest run"
