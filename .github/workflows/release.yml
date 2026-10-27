@@ -11,6 +11,8 @@ name: Release
 on:
   push:
     branches: [master]
+  # Adds a "Run workflow" button on the Actions tab to release without pushing.
+  workflow_dispatch:
 
 # One release at a time; a push during a release waits for it to finish.
 concurrency:
