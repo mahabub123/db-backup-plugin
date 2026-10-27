@@ -119,7 +119,7 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
-  await payload.destroy()
+  await payload?.destroy()
 })
 
 describe('payload-plugin-backup', () => {

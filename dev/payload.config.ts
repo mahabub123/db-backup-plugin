@@ -44,7 +44,7 @@ const getDatabaseAdapter = async (): Promise<DatabaseAdapterObj> => {
   if (process.env.NODE_ENV === 'test') {
     const { MongoMemoryReplSet } = await import('mongodb-memory-server')
     const memoryDB = await MongoMemoryReplSet.create({
-      replSet: { count: 3, dbName: 'payloadmemory' },
+      replSet: { count: 1, dbName: 'payloadmemory' },
     })
     process.env.DATABASE_URL = `${memoryDB.getUri()}&retryWrites=true`
   }
