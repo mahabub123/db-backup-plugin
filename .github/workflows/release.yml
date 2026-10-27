@@ -1,28 +1,43 @@
 name: Release
 
-# Publishes to npm when a version tag is pushed: `pnpm version patch && git push --follow-tags`.
-# Uses npm trusted publishing, so no npm token is stored in GitHub. Set it up once on
+# Every push to master runs the checks, then publishes a new version to npm:
+# - the patch number goes up by default (1.0.1 → 1.0.2)
+# - put [minor] or [major] in a commit message for 1.1.0 or 2.0.0
+# - put [skip release] in the last commit message to publish nothing
+# - a version you set yourself in package.json is published as is, if it's newer than npm's
+#
+# Uses npm trusted publishing, so no npm token is stored in GitHub. Set up once on
 # npmjs.com: package Settings → Trusted publishing → GitHub Actions, workflow `release.yml`.
 on:
   push:
-    tags: ['v*']
+    branches: [master]
+
+# One release at a time; a push during a release waits for it to finish.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
   checks:
+    if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
     uses: ./.github/workflows/ci.yml
 
   publish:
     needs: checks
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # Pushes the version commit and tag back to the repository.
+      contents: write
       # Lets npm verify this workflow and add a provenance statement to the package.
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history, so the version commit can be rebased onto newer pushes.
+          fetch-depth: 0
       - uses: pnpm/action-setup@v6
         with:
           version: 10
@@ -34,16 +49,38 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: pnpm install --frozen-lockfile
 
-      - name: Check the tag matches package.json
+      - name: Choose the version
+        env:
+          MESSAGES: ${{ join(github.event.commits.*.message, ' ') }}
         run: |
-          version=$(node -p "require('./package.json').version")
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match package.json version $version" >&2
-            exit 1
-          fi
+          name=$(node -p "require('./package.json').name")
+          current=$(node -p "require('./package.json').version")
+          latest=$(npm view "$name" version 2>/dev/null || echo 0.0.0)
+          bump=patch
+          case "$MESSAGES" in *"[minor]"*) bump=minor;; esac
+          case "$MESSAGES" in *"[major]"*) bump=major;; esac
+          next=$(node .github/next-version.mjs "$current" "$latest" "$bump")
+          if [ "$next" != "$current" ]; then npm version "$next" --no-git-tag-version; fi
+          echo "Publishing $name@$next (npm has $latest)"
+          echo "VERSION=$next" >> "$GITHUB_ENV"
 
       - run: pnpm clean && pnpm build
 
       # pnpm pack swaps in publishConfig (dist/ exports); npm then publishes that tarball.
       - run: pnpm pack
-      - run: npm publish ./payload-plugin-backup-*.tgz --access public --ignore-scripts
+      - run: npm publish ./payload-plugin-backup-${{ env.VERSION }}.tgz --access public --ignore-scripts
+
+      - name: Commit and tag the version
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet package.json; then
+            git commit -m "${VERSION} [skip release]" package.json
+            # Someone may have pushed meanwhile; put the version commit on top of their work.
+            git pull --rebase origin master
+            git push origin HEAD:master
+          fi
+          if [ -z "$(git ls-remote --tags origin "refs/tags/v${VERSION}")" ]; then
+            git tag "v${VERSION}"
+            git push origin "v${VERSION}"
+          fi

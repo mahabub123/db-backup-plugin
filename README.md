@@ -371,10 +371,14 @@ GitHub Actions runs lint, build and the tests on MongoDB, Postgres and SQLite, e
 
 ### Releasing
 
-```bash
-pnpm version patch        # or minor / major: bumps package.json, commits, tags v1.2.3
-git push --follow-tags    # the Release workflow runs the checks, then publishes to npm
-```
+Every push to `master` is released automatically. The Release workflow runs the checks, publishes the next version to npm, then commits the new version to `package.json` and tags it (`v1.2.3`).
+
+- The patch number goes up by default: 1.0.1 → 1.0.2.
+- Put `[minor]` or `[major]` in a commit message for 1.1.0 or 2.0.0.
+- Put `[skip release]` in the last commit message of a push to release nothing.
+- A version you set yourself in `package.json` is published as is, as long as it is newer than npm's.
+
+Run `git pull` after a release to get the version commit.
 
 Publishing uses npm trusted publishing, so GitHub stores no npm token. One-time setup on npmjs.com: package → Settings → Trusted publishing → GitHub Actions, with repository `mahabub123/db-backup-plugin` and workflow `release.yml`.
 
