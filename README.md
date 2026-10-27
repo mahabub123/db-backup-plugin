@@ -1,5 +1,7 @@
 # payload-plugin-backup
 
+[![CI](https://github.com/mahabub123/db-backup-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/mahabub123/db-backup-plugin/actions/workflows/ci.yml) [![npm](https://img.shields.io/npm/v/payload-plugin-backup)](https://www.npmjs.com/package/payload-plugin-backup)
+
 Back up and restore an **entire Payload CMS website** (every collection, global, draft, version, user and uploaded file) from the admin panel, the REST API, your own code or on a schedule.
 
 Built for Payload 3 following the official [Build your own plugin](https://payloadcms.com/docs/plugins/build-your-own) guide. Tested against MongoDB, Postgres and SQLite.
@@ -364,6 +366,17 @@ pnpm build                         # compiles src/ to dist/ for publishing
 ```
 
 Plugin code lives in `src/`. `dev/` is a small Payload site (localized posts with drafts, blocks and arrays, categories, media with image sizes, a versioned global) used for manual testing and the integration tests in `dev/int.spec.ts`.
+
+GitHub Actions runs lint, build and the tests on MongoDB, Postgres and SQLite, each with local and S3 storage, on every push and pull request.
+
+### Releasing
+
+```bash
+pnpm version patch        # or minor / major: bumps package.json, commits, tags v1.2.3
+git push --follow-tags    # the Release workflow runs the checks, then publishes to npm
+```
+
+Publishing uses npm trusted publishing, so GitHub stores no npm token. One-time setup on npmjs.com: package → Settings → Trusted publishing → GitHub Actions, with repository `mahabub123/db-backup-plugin` and workflow `release.yml`.
 
 ## License
 

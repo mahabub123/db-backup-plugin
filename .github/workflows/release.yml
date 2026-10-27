@@ -1,0 +1,49 @@
+name: Release
+
+# Publishes to npm when a version tag is pushed: `pnpm version patch && git push --follow-tags`.
+# Uses npm trusted publishing, so no npm token is stored in GitHub. Set it up once on
+# npmjs.com: package Settings → Trusted publishing → GitHub Actions, workflow `release.yml`.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Lets npm verify this workflow and add a provenance statement to the package.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          # Node 24 ships npm 11, which supports trusted publishing.
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+
+      - name: Check the tag matches package.json
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $version" >&2
+            exit 1
+          fi
+
+      - run: pnpm clean && pnpm build
+
+      # pnpm pack swaps in publishConfig (dist/ exports); npm then publishes that tarball.
+      - run: pnpm pack
+      - run: npm publish ./payload-plugin-backup-*.tgz --access public --ignore-scripts

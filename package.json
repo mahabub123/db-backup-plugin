@@ -2,6 +2,14 @@
   "name": "payload-plugin-backup",
   "version": "1.0.0",
   "description": "Back up and restore an entire Payload CMS site (database, versions, globals and uploaded files) from the admin panel, the REST API or on a schedule.",
+  "homepage": "https://github.com/mahabub123/db-backup-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/mahabub123/db-backup-plugin/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mahabub123/db-backup-plugin.git"
+  },
   "license": "MIT",
   "author": "Md Mahabub Alam",
   "type": "module",
@@ -40,7 +48,7 @@
     "dev:payload": "cross-env PAYLOAD_CONFIG_PATH=./dev/payload.config.ts payload",
     "generate:importmap": "pnpm dev:generate-importmap",
     "generate:types": "pnpm dev:generate-types",
-    "lint": "eslint",
+    "lint": "eslint ./src",
     "lint:fix": "eslint ./src --fix",
     "prepublishOnly": "pnpm clean && pnpm build",
     "test": "pnpm test:int && pnpm test:e2e",
