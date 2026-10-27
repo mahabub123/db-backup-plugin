@@ -15,11 +15,11 @@ jobs:
     name: Lint and build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -54,11 +54,11 @@ jobs:
       DATABASE_URL: ${{ matrix.database == 'postgres' && 'postgres://postgres:postgres@127.0.0.1:5432/payload_test' || matrix.database == 'sqlite' && 'file:./dev/ci.db' || '' }}
       PAYLOAD_SECRET: ci-test-secret
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -66,19 +66,26 @@ jobs:
 
       - name: Cache the in-memory MongoDB binary
         if: matrix.database == 'mongodb'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/mongodb-binaries
           key: mongodb-binaries-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
 
       # moto is a local S3 emulator; the S3 tests are skipped without S3_ENDPOINT.
+      - uses: actions/setup-python@v7
+        if: matrix.storage == 's3'
+        with:
+          python-version: '3.13'
       - name: Start the S3 emulator
         if: matrix.storage == 's3'
         run: |
-          pip install --quiet "moto[server]"
-          moto_server -p 5000 > moto.log 2>&1 &
-          for i in $(seq 30); do curl -sf http://127.0.0.1:5000 > /dev/null && break; sleep 1; done
-          curl -sf -X PUT http://127.0.0.1:5000/payload-backups-ci
+          python -m pip install --quiet "moto[server]"
+          python -m moto.server -p 5000 > moto.log 2>&1 &
+          for i in $(seq 60); do curl -sf http://127.0.0.1:5000 > /dev/null && break; sleep 1; done
+          if ! curl -sf -X PUT http://127.0.0.1:5000/payload-backups-ci; then
+            cat moto.log
+            exit 1
+          fi
           {
             echo "S3_ENDPOINT=http://127.0.0.1:5000"
             echo "S3_BUCKET=payload-backups-ci"
