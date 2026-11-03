@@ -8,10 +8,10 @@ Built for Payload 3 following the official [Build your own plugin](https://paylo
 
 ## What a backup contains
 
-Each backup is a single `.tar.gz` archive:
+Each backup is a single `.tar.gz` archive (`.tar.gz.enc` when [encrypted](#encryption)):
 
 ```
-manifest.json                  what is inside, Payload + plugin versions, counts
+manifest.json                  what is inside, versions, counts, SHA-256 of every file, signature
 collections/<slug>.ndjson      every document, exactly as stored (ids, password hashes, all locales)
 versions/<slug>.ndjson         drafts and version history
 globals/<slug>.json
@@ -21,7 +21,9 @@ media/<collection>/<file>      original uploads + every generated image size
 
 Documents are read and written through Payload's database adapter, not the Local API. Hooks and access control don't interfere, and hidden fields such as password hashes are kept. IDs are preserved, so relationships, uploads and drafts all line up after a restore.
 
-These collections are never backed up or overwritten: the backups collection itself, `payload-jobs`, `payload-locked-documents` and `payload-migrations` (migrations describe the current schema, not the archived one).
+On Postgres and MongoDB every collection is read from **one consistent snapshot** of the database, so a backup taken while editors keep working still has matching documents (no post pointing to an image that isn't in the archive). SQLite backups are read without a snapshot; see [Good to know](#good-to-know).
+
+These collections are never backed up or overwritten: the backups collection itself, the plugin's hidden lock collection (`backups-lock`), `payload-jobs`, `payload-locked-documents` and `payload-migrations` (migrations describe the current schema, not the archived one).
 
 ## Install
 
@@ -44,7 +46,7 @@ export default buildConfig({
 })
 ```
 
-Then regenerate the import map and types, and create a migration if you use Postgres or SQLite migrations:
+Then regenerate the import map and types, and create a migration if you use Postgres or SQLite migrations (also when upgrading from 1.1, which adds the `backups-lock` collection and a few fields):
 
 ```bash
 pnpm payload generate:importmap
@@ -62,12 +64,13 @@ Use these to keep a copy of your site on your own computer, or to move a site to
 
 - **Export new backup** at the top of the Backups list creates a fresh backup and downloads it straight away.
 - The **Export** link on every row downloads that backup.
-- **Export (download .tar.gz)** does the same from inside a backup.
+- **Export (download)** does the same from inside a backup. **Verify** next to it downloads the backup again and checks it can be restored, without changing anything.
 
 **Import** (upload a `.tar.gz` file, from this site or another one):
 
 - **Import backup…** at the top of the Backups list uploads the file.
 - The file is checked before it is accepted. It must be a backup made by this plugin, from the same kind of database (MongoDB, Postgres or SQLite).
+- Backups that are not [signed by this site](#signed-archives) (made by another site, by a version before 1.2, or changed by someone) can only be restored after ticking *I trust where this backup came from*.
 - Then you choose **Restore now** (type `RESTORE` to confirm) or **Keep for later**. A kept import shows in the list as type *Imported* and can be restored at any time.
 - You are warned when the backup contains collections or globals this site no longer has. Those are skipped; everything else is restored.
 
@@ -88,9 +91,13 @@ pnpm payload backup:import ./site-2026-10-27.tar.gz
 # ...or add it and restore it right away (asks you to type RESTORE)
 pnpm payload backup:import ./site-2026-10-27.tar.gz --restore
 pnpm payload backup:import ./site-2026-10-27.tar.gz --restore --yes   # no prompt, for scripts
+pnpm payload backup:import ./other-site.tar.gz --restore --allow-unverified  # archive not signed by this site
 
 # add everything in the bucket that is missing from the list (after losing the database)
 pnpm payload backup:sync
+
+# download a backup and check it can be restored (exit code 1 when it can't)
+pnpm payload backup:verify 12
 ```
 
 Moving a site to a new server:
@@ -159,11 +166,12 @@ Open **System → Backup Settings**:
 - **Automatic backups**: on/off
 - **Time of day** and **Timezone** (e.g. `03:00`, `Asia/Dhaka`)
 - **Include uploaded files**
+- **Verify each backup** (default on): downloads and checks every scheduled backup right after it is stored, so a broken backup is noticed the same day. Retention never deletes the newest verified backup.
 - **Daily**: keep the last *N* (default 7)
 - **Weekly**: day of the week, keep the last *N* (default 4)
 - **Monthly**: day of the month, keep the last *N* (default 12). In shorter months the last day is used.
 
-The top of the page shows where backups go, plus the last and next backup for each schedule. Older backups beyond the keep counts are deleted automatically, from the list and from the bucket. When schedules coincide (a Sunday that is also the 1st), **one** backup is taken and counts for each of them.
+The top of the page shows where backups go, the last and next backup for each schedule, and any problem (a late or failed backup). Older backups beyond the keep counts are deleted automatically, from the list and from the bucket. When schedules coincide (a Sunday that is also the 1st), **one** backup is taken and counts for each of them.
 
 You can set the initial values in code; editors can change them later in the admin panel:
 
@@ -213,7 +221,31 @@ curl -fsS -H "Authorization: Bearer $CRON_SECRET" https://example.com/api/backup
 
 Each call takes at most one backup and only when one is due, so calling it often is harmless. Backups run inside that request; check your platform's function time limit (Vercel `maxDuration`) against your site's size.
 
-If a scheduled backup fails, it is recorded as *Failed* with the error, and retried an hour later.
+If a scheduled backup fails, it is recorded as *Failed* with the error, and retried an hour later. A backup cut off before it could finish (time limit, crash, deploy) is detected within about two minutes: its lock stops being renewed, and the next backup or restore marks it *Failed* (*Interrupted*) and carries on. Use the [health check](#monitoring) to hear about it.
+
+### Monitoring
+
+Backups that silently stop are the worst kind. Two ways to notice:
+
+**Health check.** `GET /api/backups/health` (with `Authorization: Bearer <cronSecret>`, or as an admin) answers `200` while every enabled schedule has a completed backup for its last planned time, and `503` when one is more than `healthGraceMinutes` (default 120) late, the last scheduled backup failed, or the newest backup failed verification. The body lists the problems. Point an uptime monitor (UptimeRobot, Better Stack, Healthchecks…) at it.
+
+**Callbacks.** Send an email, a Slack message or a metric from your own code:
+
+```ts
+backupPlugin({
+  afterBackup: async ({ backup, payload }) => { /* e.g. record the size */ },
+  afterBackupFailed: async ({ backup, error, payload }) => {
+    await payload.sendEmail({
+      to: 'ops@example.com',
+      subject: `Backup failed: ${backup?.filename}`,
+      text: String(error),
+    })
+  },
+  afterRestore: async ({ backup, error, summary, payload }) => { /* error is set when it failed */ },
+})
+```
+
+`afterBackupFailed` is also called for backups found interrupted. Errors thrown in callbacks are logged and don't change the backup.
 
 ### Disaster recovery: restoring from the bucket on a new server
 
@@ -222,6 +254,27 @@ If the server and its database are lost, the archives are still in your bucket:
 1. Deploy the same code to a new server with an empty database and the **same storage settings**. Run your migrations.
 2. Create the first admin user, open **Backups** and click **Find backups in storage**, or run `pnpm payload backup:sync`.
 3. Every archive in the bucket appears in the list (type *Found in storage*). Open the one you want and click **Restore…**.
+
+### Encryption
+
+Archives contain every document and password hash of the site. When they are kept in a bucket, encrypt them:
+
+```ts
+backupPlugin({
+  encryption: {
+    key: process.env.BACKUP_ENCRYPTION_KEY!,    // e.g. `openssl rand -base64 32`
+    previousKeys: [process.env.OLD_BACKUP_KEY!], // optional, after changing the key
+  },
+})
+```
+
+Archives are then encrypted with AES-256-GCM (key derived with scrypt, sealed in 1 MB chunks so they can't be reordered or cut off unnoticed) before they leave the server, and named `.tar.gz.enc`. Exports download the encrypted file; importing it on a site with the same key works as usual. **Keep the key outside the site** (a password manager): without it, encrypted backups cannot be restored.
+
+### Signed archives
+
+Every manifest lists the SHA-256 of every file in the archive and is signed (HMAC-SHA256) with a key derived from your `PAYLOAD_SECRET`. A restore checks both: a changed or added file is refused, and an archive this site didn't sign (made elsewhere, by a version before 1.2, or forged by someone with write access to the bucket) needs an explicit confirmation, because restoring it replaces every user account. Backups this site recorded itself before 1.2 are still trusted through the checksum in their record.
+
+Moving backups between sites with different secrets? Set the same `signing.secret` on both, or list the other site's secret in `signing.previousSecrets`.
 
 ### Switching storage
 
@@ -247,6 +300,13 @@ const myStorage: BackupStorageAdapter = {
 backupPlugin({
   access: ({ req }) => req.user?.role === 'admin', // default: any signed-in admin-panel user
   storage: localStorageAdapter({ directory: './backups' }), // default; see r2StorageAdapter / s3StorageAdapter
+  encryption: undefined,     // { key, previousKeys? }, see "Encryption"
+  signing: {},               // { secret?, previousSecrets? }, default secret: PAYLOAD_SECRET
+  afterBackup: undefined,    // callbacks, see "Monitoring"
+  afterBackupFailed: undefined,
+  afterRestore: undefined,
+  healthGraceMinutes: 120,   // when GET /api/backups/health reports a late backup
+  blockWritesDuringRestore: true, // pause writes on every server while a restore runs
   schedule: {
     defaults: { /* see above */ },
     runOnServer: true,       // timer inside the Payload server
@@ -298,13 +358,15 @@ All endpoints use the plugin's `access` function.
 | POST   | `/api/backups/run`                     | `{ "includeMedia": true }`     |
 | GET    | `/api/backups/:id/download`            | (export)                       |
 | POST   | `/api/backups/import?filename=x.tar.gz` | the `.tar.gz` file as raw body |
-| POST   | `/api/backups/:id/restore`             | `{ "confirm": "RESTORE" }`     |
+| POST   | `/api/backups/:id/restore`             | `{ "confirm": "RESTORE", "allowUnverified": false }` |
+| POST   | `/api/backups/:id/verify`              | checks the backup, changes nothing |
 | POST   | `/api/backups/sync`                    | finds archives in storage      |
 | GET    | `/api/backups/cron`                    | runs the schedule (`Bearer <cronSecret>` or admin) |
+| GET    | `/api/backups/health`                  | `200` healthy / `503` late or failing (`Bearer <cronSecret>` or admin) |
 | GET    | `/api/backups`                         | list (standard Payload REST)   |
 | DELETE | `/api/backups/:id`                     | deletes record and archive     |
 
-`import` answers `400` for files that are not backups or come from another kind of database, and returns `warnings` for collections or globals that will be skipped.
+`import` answers `400` for files that are not backups, come from another kind of database or can't be decrypted, and returns `warnings` for collections or globals that will be skipped, schema changes since the backup, and archives not signed by this site. `restore` answers `400` for changed archives, and for unsigned ones unless `allowUnverified` is `true`.
 
 ```bash
 # export
@@ -320,36 +382,43 @@ curl -X POST -H "Authorization: users API-Key $PAYLOAD_API_KEY" \
 ## Local API
 
 ```ts
-import { createBackup, restoreBackup } from 'payload-plugin-backup'
+import { createBackup, getBackupHealth, restoreBackup, verifyBackup } from 'payload-plugin-backup'
 
 const backup = await createBackup(payload, { includeMedia: true })
+const { ok, errors } = await verifyBackup(payload, backup.id)
 await restoreBackup(payload, backup.id)
+await restoreBackup(payload, importedId, { allowUnverified: true }) // an archive from another site
+const health = await getBackupHealth(payload) // { ok, problems, schedules, ... }
 ```
 
-While a restore writes to the database, `req.context.payloadPluginBackupRestore` is `true` (exported as `RESTORE_CONTEXT_KEY`).
+While a restore writes to the database, `req.context.payloadPluginBackupRestore` is `true` (exported as `RESTORE_CONTEXT_KEY`). Set it on your own writes to let them through while writes are paused for a restore.
 
 ## How a restore works
 
-1. The archive is downloaded, its SHA-256 checksum verified and extracted.
-2. A safety backup of the current state is taken (`type: pre-restore`). It also shows up in the list, so a restore can be undone by restoring it.
-3. In **one database transaction**: every backed-up collection is emptied and refilled with the original ids, versions are rebuilt oldest-first, and globals are overwritten.
+1. The restore takes the lock (see below), and writes to the site are paused on every server: saving a document answers `503` (*the site is being restored*) until it has finished, so nothing written meanwhile is lost.
+2. The archive is downloaded, its SHA-256 checksum verified, decrypted if needed and extracted. Only regular files are unpacked (no links).
+3. Every file is checked against the checksums in the manifest, and the manifest's signature is checked (see [Signed archives](#signed-archives)).
+4. A safety backup of the current state is taken (`type: pre-restore`). It also shows up in the list, so a restore can be undone by restoring it.
+5. In **one database transaction**: every backed-up collection is emptied and refilled with the original ids, versions are rebuilt oldest-first, and globals are overwritten.
    - Postgres/SQLite: foreign-key checks are postponed until the end of the transaction so documents can reference each other in any order. They are then verified all at once and the constraints are put back exactly as Payload created them. Serial id sequences are moved past the restored ids.
-4. After the commit, uploaded files are written back.
+6. After the commit, uploaded files are written back. A file that can't be written is listed in `summary.files.failed` instead of failing the restore.
 
-If anything fails in step 3, the transaction is rolled back and the database is left untouched.
+If anything fails in step 5, the transaction is rolled back and the database is left untouched.
 
-Only one backup or restore runs at a time. Starting another one meanwhile answers `409` (*already in progress*), a restore waits for backups running on other server instances, and the schedule simply checks again a few minutes later. The **Backup Settings** are never part of a backup, so a restore can't change or turn off your schedule.
+**One backup or restore at a time, across all servers.** The lock is a single row in the hidden `backups-lock` collection, renewed every 15 seconds while the task runs. Starting another task meanwhile, on any server, answers `409` (*already in progress*), and the schedule simply checks again a few minutes later. A server that dies stops renewing it; after two minutes the next task takes the lock over and marks the interrupted backup as failed. The **Backup Settings** are never part of a backup, so a restore can't change or turn off your schedule.
 
 ## Good to know
 
 - **Restore into the same database engine.** MongoDB ObjectIDs and SQL ids aren't interchangeable, and imports from another engine are refused. Moving between servers on the same engine (local → production, Neon → RDS, Atlas → self-hosted) works.
-- **Same schema.** Restore into a site running the same collections and fields as when the backup was taken. Run your migrations first. Collections or globals that no longer exist are skipped and reported.
+- **Same schema.** Restore into a site running the same collections and fields as when the backup was taken. Run your migrations first. Collections or globals that no longer exist are skipped and reported, and the manifest records which migrations had run, so you are warned when the schema changed since.
 - **Users are restored too.** Passwords revert to what they were at backup time, and you may be signed out.
-- **Large MongoDB databases.** MongoDB ends transactions after 60 seconds. A restore that takes longer (in our tests, 20,000 posts with 40,000 versions did) is rolled back by MongoDB and then automatically run again, committing every `batchSize` documents; if that second run fails halfway, restore the safety backup taken just before. Set `useTransaction: true` to only ever restore all at once, or `false` to skip the first attempt. Postgres and SQLite always restore in one transaction, however long it takes.
-- **Disk space.** Archives are built and unpacked in `tempDir` (the system temp folder by default) before they are uploaded or restored. Leave free space for about twice the size of your database plus uploads, or point `tempDir` at a larger disk.
-- **Serverless timeouts.** `run` and `restore` work inside the request. On platforms with short function timeouts, use `schedule` with a jobs runner, or call `createBackup` from a script.
-- Backups contain password hashes and all private content. Restrict `access`, keep buckets private and treat downloaded archives as secrets.
-- A backup you have never restored is not a verified backup. Test restoring into a staging site regularly.
+- **Large MongoDB databases.** MongoDB ends transactions after 60 seconds. A restore that takes longer (in our tests, 20,000 posts with 40,000 versions did) is rolled back by MongoDB and then automatically run again, committing every `batchSize` documents; if that second run fails halfway, restore the safety backup taken just before. Set `useTransaction: true` to only ever restore all at once, or `false` to skip the first attempt. Postgres always restores in one transaction, however long it takes. MongoDB snapshots also end after 60 seconds: a backup that takes longer is read again without a snapshot, and the backup says so (*Consistent snapshot* unticked).
+- **SQLite.** Payload's SQLite adapter runs no transactions unless you set `transactionOptions: {}` in `sqliteAdapter`. Do that: otherwise a failing restore can leave the site half restored (the safety backup can undo it). SQLite backups are never read from a snapshot, because Payload's SQLite transactions take the write lock and would block every editor until the backup ends; take them when the site is quiet (the schedule runs at night by default).
+- **Disk space.** Archives are built and unpacked in `tempDir` (the system temp folder by default) before they are uploaded or restored. Local uploads are linked into the archive, not copied first. Leave free space for about the size of your database plus uploads when backing up, and twice that when restoring, or point `tempDir` at a larger disk.
+- **Serverless timeouts.** `run` and `restore` work inside the request. A backup cut off by the platform's time limit is detected and reported (see [Monitoring](#monitoring)), but it never completes: if your site is too large for the limit, take backups from a long-running server or a script (`pnpm payload backup:export`).
+- **Writes are paused during a restore** on every server (`blockWritesDuringRestore`). Each server checks the lock at most every 2 seconds, and a restore only starts writing after downloading, checking and taking the safety backup. Add the backup plugin last in `plugins`, so collections added by other plugins are covered too.
+- Backups contain password hashes and all private content. Restrict `access`, keep buckets private, use [encryption](#encryption) and treat downloaded archives as secrets.
+- A backup you have never restored is not a verified backup. Keep **Verify each backup** on, and test restoring into a staging site now and then.
 
 ## Developing this plugin
 
@@ -361,6 +430,7 @@ pnpm dev                           # http://localhost:3000/admin, dev@payloadcms
 pnpm test:int                                   # MongoDB in memory, backups in ./backups
 DATABASE_ADAPTER=postgres DATABASE_URL=postgres://127.0.0.1:5432/payload_backup_plugin_test pnpm test:int
 DATABASE_ADAPTER=sqlite DATABASE_URL=file:/tmp/backup-test.db pnpm test:int
+SQLITE_TRANSACTIONS=1 DATABASE_ADAPTER=sqlite DATABASE_URL=file:/tmp/backup-test-tx.db pnpm test:int
 
 # against any S3-compatible server (MinIO, moto, a real bucket)
 S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=test S3_ACCESS_KEY_ID=x S3_SECRET_ACCESS_KEY=y pnpm test:int

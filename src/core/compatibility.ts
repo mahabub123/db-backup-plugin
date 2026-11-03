@@ -67,3 +67,49 @@ export const checkCompatibility = ({
 
   return { errors, warnings }
 }
+
+/**
+ * Compares the migrations that had run when the archive was made with the
+ * ones that have run here. A difference means the schema changed since:
+ * fields added since are empty after the restore, removed ones are dropped,
+ * and on Postgres a new required column without a default makes the restore fail.
+ */
+export const checkMigrations = async ({
+  manifest,
+  payload,
+}: {
+  manifest: BackupManifest
+  payload: Payload
+}): Promise<string[]> => {
+  if (!manifest.migrations || !payload.collections['payload-migrations']) {
+    return []
+  }
+  let current: string[]
+  try {
+    const { docs } = await payload.db.find({
+      collection: 'payload-migrations',
+      limit: 0,
+      pagination: false,
+    })
+    current = docs
+      .map((doc) => (doc as { name?: unknown }).name)
+      .filter((name): name is string => typeof name === 'string' && name !== 'dev')
+  } catch {
+    return []
+  }
+  const archived = new Set(manifest.migrations)
+  const newer = current.filter((name) => !archived.has(name))
+  const unknown = manifest.migrations.filter((name) => !current.includes(name))
+  const warnings: string[] = []
+  if (newer.length) {
+    warnings.push(
+      `The database schema changed since this backup: ${newer.length} migration(s) ran after it (${newer.slice(-3).join(', ')}). Content of fields added since will be empty.`,
+    )
+  }
+  if (unknown.length) {
+    warnings.push(
+      `This backup comes from a schema with ${unknown.length} migration(s) this site doesn't have (${unknown.slice(-3).join(', ')}). Run your migrations first, or restore it on a site with the same code.`,
+    )
+  }
+  return warnings
+}

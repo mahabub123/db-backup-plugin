@@ -7,15 +7,22 @@ import path from 'path'
 import { createPayloadRequest, getPayload } from 'payload'
 import {
   createBackup,
+  getBackupHealth,
   RESTORE_CONTEXT_KEY,
   restoreBackup,
   runScheduledBackups,
+  verifyBackup,
 } from 'payload-plugin-backup'
 import sharp from 'sharp'
 import * as tar from 'tar'
 import { fileURLToPath } from 'url'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 
+import { checkMigrations } from '../src/core/compatibility.js'
+import { supportsTransactions } from '../src/core/database.js'
+import { isEncryptedFile } from '../src/core/integrity.js'
+import { LEASE_ID, STALE_AFTER } from '../src/core/lock.js'
+import { extractArchive } from '../src/core/restoreBackup.js'
 import { getOptions } from '../src/utilities/getOptions.js'
 import { devUser } from './helpers/credentials.js'
 
@@ -24,6 +31,8 @@ const mediaDir = path.resolve(dirname, process.env.MEDIA_DIR || 'media')
 
 let payload: Payload
 let user: TypedUser
+/** Backups read from one snapshot on Postgres and MongoDB (not SQLite, see beginReadSnapshot). */
+let hasSnapshots = true
 
 const exists = (file: string) =>
   fs.access(file).then(
@@ -128,6 +137,7 @@ const importArchive = async (archive: Buffer) => {
 
 beforeAll(async () => {
   payload = await getPayload({ config })
+  hasSnapshots = supportsTransactions(payload) && !payload.db.packageName?.includes('sqlite')
   const { docs } = await payload.find({
     collection: 'users',
     where: { email: { equals: devUser.email } },
@@ -323,6 +333,9 @@ describe('payload-plugin-backup', () => {
     expect(imported.status).toBe(201)
     const { doc } = await imported.json()
     expect(doc.type).toBe('imported')
+    expect(doc.signed).toBe(true)
+    expect(backup.signed).toBe(true)
+    expect(backup.snapshot).toBe(hasSnapshots)
     expect(doc.checksum).toBe(backup.checksum)
     expect(doc.documents).toBe(backup.documents)
 
@@ -368,8 +381,12 @@ describe('payload-plugin-backup', () => {
     expect(doc.importedFrom).toBe('site.tar.gz')
     expect(warnings.join(' ')).toContain('old-collection')
 
+    // Editing the manifest broke its signature: a restore needs explicit trust.
+    expect(doc.signed).toBe(false)
+    await expect(restoreBackup(payload, doc.id, { user })).rejects.toThrow(/not signed by this site/)
+
     await payload.delete({ id: category.id, collection: 'categories' })
-    const { summary } = await restoreBackup(payload, doc.id, { user })
+    const { summary } = await restoreBackup(payload, doc.id, { allowUnverified: true, user })
     expect(summary.skipped).toEqual(['old-collection'])
     const restored = await payload.findByID({ id: category.id, collection: 'categories' })
     expect(restored.title).toBe('Kept')
@@ -502,18 +519,282 @@ describe('payload-plugin-backup', () => {
     expect(await payload.count({ collection: 'users' })).toEqual({ totalDocs: 1 })
   })
 
-  test('refuses to restore while another server is taking a backup', async () => {
+  test('refuses to run while another server holds the lock, and takes over a stale one', async () => {
+    const options = getOptions(payload)
     const backup = await createBackup(payload, { includeMedia: false, user })
+    const lease = (heartbeatAt: number) => ({
+      id: LEASE_ID,
+      heartbeatAt,
+      owner: 'other-server:1:abcd',
+      startedAt: heartbeatAt,
+      task: 'backup',
+    })
+
+    // Another server is taking a backup right now (its heartbeat is fresh).
+    await payload.db.create({ collection: options.lockSlug, customID: LEASE_ID, data: lease(Date.now()) })
+    // ...and its backup record says so.
     const running = await payload.create({
       collection: 'backups',
       data: { type: 'manual', filename: 'elsewhere.tar.gz', startedAt: new Date().toISOString(), status: 'running' },
       overrideAccess: true,
     })
     try {
-      await expect(restoreBackup(payload, backup.id, { user })).rejects.toThrow(/being taken right now/)
+      await expect(restoreBackup(payload, backup.id, { user })).rejects.toThrow(
+        /backup is already in progress on another server/,
+      )
+      await expect(createBackup(payload, { includeMedia: false, user })).rejects.toThrow(
+        /on another server/,
+      )
+      expect((await payload.findByID({ id: running.id, collection: 'backups' })).status).toBe('running')
+
+      // That server died: no heartbeat for longer than STALE_AFTER.
+      await payload.db.updateOne({
+        collection: options.lockSlug,
+        data: { heartbeatAt: Date.now() - STALE_AFTER - 1000 },
+        where: { id: { equals: LEASE_ID } },
+      })
+      const failures: unknown[] = []
+      options.afterBackupFailed = ({ backup: failed }) => {
+        failures.push(failed?.filename)
+      }
+      const next = await createBackup(payload, { includeMedia: false, user })
+      expect(next.status).toBe('completed')
+
+      // Its backup is marked interrupted, and reported.
+      const interrupted = await payload.findByID({ id: running.id, collection: 'backups' })
+      expect(interrupted.status).toBe('failed')
+      expect(interrupted.error).toMatch(/Interrupted/)
+      expect(failures).toEqual(['elsewhere.tar.gz'])
+      // The lock was released afterwards.
+      expect(await payload.db.findOne({ collection: options.lockSlug, where: {} })).toBeNull()
     } finally {
+      options.afterBackupFailed = undefined
+      await payload.db.deleteOne({ collection: options.lockSlug, where: { id: { equals: LEASE_ID } } }).catch(() => undefined)
       await payload.db.deleteOne({ collection: 'backups', where: { id: { equals: running.id } } })
     }
+  })
+
+  test('keeps renewing its lock while a restore holds the database', async () => {
+    const options = getOptions(payload)
+    const backup = await createBackup(payload, { includeMedia: false, user })
+    const create = payload.db.create
+    let renewed: string | undefined
+    // In the middle of the restore transaction (after foreign keys were deferred on
+    // Postgres), renew the lease the way the heartbeat does, on another connection.
+    // SQLite has a single writer and skips renewals during a restore (see withLock).
+    const sqlite = Boolean(payload.db.packageName?.includes('sqlite'))
+    payload.db.create = (async (args) => {
+      if (!sqlite && !renewed && args.req?.context?.[RESTORE_CONTEXT_KEY]) {
+        renewed = await Promise.race([
+          payload.db
+            .updateOne({
+              collection: options.lockSlug,
+              data: { heartbeatAt: Date.now() },
+              where: { id: { equals: LEASE_ID } },
+              ...(payload.db.name === 'mongoose' ? {} : { options: { atomic: true } }),
+            })
+            .then((lease) => (lease ? 'renewed' : 'missing'))
+            .catch(() => 'busy'),
+          new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 5000)),
+        ])
+      }
+      return create.call(payload.db, args)
+    }) as typeof create
+    try {
+      await restoreBackup(payload, backup.id, { user })
+    } finally {
+      payload.db.create = create
+    }
+    expect(renewed).toBe(sqlite ? undefined : 'renewed')
+    // The lock is released afterwards.
+    expect(await payload.db.findOne({ collection: options.lockSlug, where: {} })).toBeNull()
+  })
+
+  test('reads every collection from one snapshot, even while editors keep working', async () => {
+    const find = payload.db.find
+    let written = false
+    // Right after the backup's first read, an editor creates a category on another
+    // connection. The backup reads categories later, but must not see it.
+    payload.db.find = (async (args) => {
+      const result = await find.call(payload.db, args)
+      if (!written && args.req?.transactionID && args.collection === 'users') {
+        written = true
+        await payload.db.create({ collection: 'categories', data: { title: 'Written during the backup' } })
+      }
+      return result
+    }) as typeof find
+    let backup
+    try {
+      backup = await createBackup(payload, { includeMedia: false, user })
+    } finally {
+      payload.db.find = find
+    }
+    if (!hasSnapshots) {
+      // No snapshot to read from: the backup says so instead.
+      expect(backup.snapshot).toBe(false)
+      await payload.delete({ collection: 'categories', where: { title: { equals: 'Written during the backup' } } })
+      return
+    }
+    expect(written).toBe(true)
+    expect(backup.snapshot).toBe(true)
+    const categories = await readArchiveFile(await downloadArchive(backup.id), 'collections/categories.ndjson')
+    expect(categories).not.toContain('Written during the backup')
+    await payload.delete({ collection: 'categories', where: { title: { equals: 'Written during the backup' } } })
+  })
+
+  test('pauses writes while a restore runs on any server', async () => {
+    const options = getOptions(payload)
+    await payload.db.create({
+      collection: options.lockSlug,
+      customID: LEASE_ID,
+      data: { id: LEASE_ID, heartbeatAt: Date.now(), owner: 'other-server:2:abcd', startedAt: Date.now(), task: 'restore' },
+    })
+    // Each server looks at the lease at most every 2 seconds.
+    await new Promise((resolve) => setTimeout(resolve, 2100))
+    try {
+      await expect(
+        payload.create({ collection: 'categories', data: { title: 'During restore' } }),
+      ).rejects.toThrow(/being restored/)
+      await expect(
+        payload.updateGlobal({ slug: 'site-settings', data: { siteName: 'During restore' } }),
+      ).rejects.toThrow(/being restored/)
+      // Code that knows what it is doing can still write.
+      const allowed = await payload.create({
+        collection: 'categories',
+        context: { [RESTORE_CONTEXT_KEY]: true },
+        data: { title: 'Allowed during restore' },
+      })
+      await payload.delete({ id: allowed.id, collection: 'categories', context: { [RESTORE_CONTEXT_KEY]: true } })
+    } finally {
+      await payload.db.deleteOne({ collection: options.lockSlug, where: { id: { equals: LEASE_ID } } })
+    }
+    // The guard caches its answer for 2 seconds.
+    await new Promise((resolve) => setTimeout(resolve, 2100))
+    const category = await payload.create({ collection: 'categories', data: { title: 'After restore' } })
+    await payload.delete({ id: category.id, collection: 'categories' })
+  })
+
+  test('refuses archives that were changed after the backup', async () => {
+    const category = await payload.create({ collection: 'categories', data: { title: 'Original' } })
+    const backup = await createBackup(payload, { includeMedia: false, user })
+
+    // Someone with access to the bucket edits a document, keeping the manifest.
+    const archive = await downloadArchive(backup.id)
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'backup-test-'))
+    try {
+      await fs.writeFile(path.join(dir, 'in.tar.gz'), archive)
+      await fs.mkdir(path.join(dir, 'data'))
+      await tar.extract({ cwd: path.join(dir, 'data'), file: path.join(dir, 'in.tar.gz') })
+      const file = path.join(dir, 'data', 'collections', 'categories.ndjson')
+      await fs.writeFile(file, (await fs.readFile(file, 'utf8')).replace('Original', 'Forged'))
+      await tar.create({ cwd: path.join(dir, 'data'), file: path.join(dir, 'out.tar.gz'), gzip: true }, ['.'])
+      const response = await importArchive(await fs.readFile(path.join(dir, 'out.tar.gz')))
+      const { doc } = await response.json()
+
+      // Even with explicit trust: the checksums inside the manifest don't match.
+      await expect(restoreBackup(payload, doc.id, { allowUnverified: true, user })).rejects.toThrow(
+        /categories\.ndjson was changed/,
+      )
+      const verification = await verifyBackup(payload, doc.id)
+      expect(verification.ok).toBe(false)
+    } finally {
+      await fs.rm(dir, { force: true, recursive: true })
+      await payload.delete({ id: category.id, collection: 'categories' })
+    }
+  })
+
+  test('verifies a stored backup without touching the site', async () => {
+    const backup = await createBackup(payload, { includeMedia: true, user })
+    const result = await verifyBackup(payload, backup.id)
+    expect(result.errors).toEqual([])
+    expect(result.ok).toBe(true)
+    expect(result.signed).toBe(true)
+    expect(result.documents).toBe(backup.documents)
+    const stored = await payload.findByID({ id: backup.id, collection: 'backups' })
+    expect(stored.verified).toBe(true)
+    expect(stored.verifiedAt).toBeTruthy()
+  })
+
+  test('encrypts archives when a key is set', async () => {
+    const options = getOptions(payload)
+    const category = await payload.create({ collection: 'categories', data: { title: 'Secret' } })
+    options.encryption = { key: 'a-long-random-test-key', previousKeys: [] }
+    let backup
+    try {
+      backup = await createBackup(payload, { includeMedia: true, user })
+      expect(backup.filename).toMatch(/\.tar\.gz\.enc$/)
+      expect(backup.encrypted).toBe(true)
+
+      const archive = await downloadArchive(backup.id)
+      expect(archive.includes(Buffer.from('Secret'))).toBe(false)
+      const file = path.join(os.tmpdir(), `enc-${Date.now()}`)
+      await fs.writeFile(file, archive)
+      expect(await isEncryptedFile(file)).toBe(true)
+      await fs.rm(file)
+
+      expect((await verifyBackup(payload, backup.id)).ok).toBe(true)
+      await payload.update({ id: category.id, collection: 'categories', data: { title: 'Changed' } })
+
+      // After a key change, the old key still decrypts.
+      options.encryption = { key: 'the-new-key', previousKeys: ['a-long-random-test-key'] }
+      await restoreBackup(payload, backup.id, { user })
+      expect((await payload.findByID({ id: category.id, collection: 'categories' })).title).toBe('Secret')
+
+      // Without the key there is no way in.
+      options.encryption = { key: 'a-wrong-key', previousKeys: [] }
+      await expect(restoreBackup(payload, backup.id, { user })).rejects.toThrow(/none of the configured encryption keys/)
+      options.encryption = undefined
+      await expect(restoreBackup(payload, backup.id, { user })).rejects.toThrow(/This backup is encrypted/)
+    } finally {
+      options.encryption = undefined
+      await payload.delete({ id: category.id, collection: 'categories' })
+    }
+  })
+
+  test('reports completed and failed backups to the callbacks', async () => {
+    const options = getOptions(payload)
+    const events: string[] = []
+    options.afterBackup = ({ backup }) => {
+      events.push(`done ${backup.status}`)
+    }
+    options.afterBackupFailed = ({ error }) => {
+      events.push(`failed ${(error as Error).message}`)
+    }
+    const upload = options.storage.upload
+    try {
+      await createBackup(payload, { includeMedia: false, user })
+      options.storage.upload = () => Promise.reject(new Error('bucket unavailable'))
+      await expect(createBackup(payload, { includeMedia: false, user })).rejects.toThrow(/bucket unavailable/)
+    } finally {
+      options.storage.upload = upload
+      options.afterBackup = undefined
+      options.afterBackupFailed = undefined
+    }
+    expect(events).toEqual(['done completed', 'failed bucket unavailable'])
+  })
+
+  test('never unpacks links from an archive', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'backup-test-'))
+    try {
+      await fs.mkdir(path.join(dir, 'src'))
+      await fs.writeFile(path.join(dir, 'src', 'ok.txt'), 'fine')
+      await fs.symlink('/etc/hosts', path.join(dir, 'src', 'evil'))
+      await tar.create({ cwd: path.join(dir, 'src'), file: path.join(dir, 'a.tar.gz'), gzip: true }, ['.'])
+      await extractArchive({ archivePath: path.join(dir, 'a.tar.gz'), dir: path.join(dir, 'out') })
+      expect(await exists(path.join(dir, 'out', 'ok.txt'))).toBe(true)
+      expect(await exists(path.join(dir, 'out', 'evil'))).toBe(false)
+    } finally {
+      await fs.rm(dir, { force: true, recursive: true })
+    }
+  })
+
+  test('warns when the schema changed since the backup', async () => {
+    const warnings = await checkMigrations({
+      manifest: { migrations: ['20200101_000000_old_schema'] } as any,
+      payload,
+    })
+    // The in-memory test database has no migrations; the archive's one is unknown here.
+    expect(warnings.join(' ')).toMatch(/migration\(s\) this site doesn't have/)
   })
 })
 
@@ -607,6 +888,38 @@ describe('automatic backups', () => {
     const response = await getEndpoint('/cron', 'get').handler(allowed)
     expect(response.status).toBe(200)
     expect((await response.json()).message).toBeTruthy()
+  })
+
+  test('the health check reports late and failed scheduled backups', async () => {
+    const options = getOptions(payload)
+    // Backups ran up to 2026-11-08 03:05 (the tests above).
+    const healthy = await getBackupHealth(payload)
+    expect(typeof healthy.ok).toBe('boolean')
+    const onTime = await (await import('../src/core/health.js')).getBackupHealth({
+      now: new Date('2026-11-08T04:00:00Z'),
+      options,
+      payload,
+    })
+    expect(onTime.problems).toEqual([])
+    expect(onTime.ok).toBe(true)
+
+    // Two days later nothing has run: the daily backup is overdue.
+    const late = await (await import('../src/core/health.js')).getBackupHealth({
+      now: new Date('2026-11-10T06:00:00Z'),
+      options,
+      payload,
+    })
+    expect(late.ok).toBe(false)
+    expect(late.problems.join(' ')).toMatch(/daily backup planned for 2026-11-10T03:00:00.000Z has not completed/)
+
+    const req = await buildRequest({
+      headers: { Authorization: `Bearer ${process.env.CRON_SECRET}` },
+      url: '/health',
+      withUser: false,
+    })
+    const response = await getEndpoint('/health', 'get').handler(req)
+    expect([200, 503]).toContain(response.status)
+    expect((await response.json()).schedules).toBeDefined()
   })
 
   test('waits while a restore runs, and a restore keeps the schedule', async () => {

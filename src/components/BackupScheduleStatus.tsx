@@ -2,6 +2,7 @@ import type { Payload } from 'payload'
 
 import type { BackupFrequency } from '../types.js'
 
+import { getBackupHealth } from '../core/health.js'
 import {
   FREQUENCIES,
   getEnabledFrequencies,
@@ -71,6 +72,8 @@ export const BackupScheduleStatus = async ({ payload }: { payload: Payload }) =>
     }),
   )
 
+  const health = await getBackupHealth({ now, options, payload })
+
   const trigger = options.schedule.runOnServer
     ? `This server checks every ${options.schedule.intervalMinutes} minutes whether a backup is due.`
     : options.schedule.cronSecret
@@ -80,8 +83,16 @@ export const BackupScheduleStatus = async ({ payload }: { payload: Payload }) =>
   return (
     <div style={boxStyle}>
       <div>
-        <strong>Storage:</strong> {options.storage.name} · {trigger}
+        <strong>Storage:</strong> {options.storage.name}
+        {options.encryption ? ' (encrypted)' : ''} · {trigger}
       </div>
+      {health.problems.length > 0 && (
+        <ul style={{ color: 'var(--theme-error-500)', margin: 0, paddingLeft: '1.2em' }}>
+          {health.problems.map((problem) => (
+            <li key={problem}>{problem}</li>
+          ))}
+        </ul>
+      )}
       {!settings.enabled ? (
         <div>Automatic backups are off. Turn them on below and save.</div>
       ) : (

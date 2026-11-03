@@ -36,6 +36,64 @@ export const getDatabaseKind = (payload: Payload): DatabaseKind => {
   return kind === 'other' ? getAdapterKind(payload.db.name) : kind
 }
 
+/**
+ * MongoDB ends a transaction that runs longer than 60 seconds
+ * (`transactionLifetimeLimitSeconds`), or whose snapshot is too old;
+ * everything it did is discarded.
+ */
+export const isTransactionTimeout = (error: unknown): boolean => {
+  const { code, codeName, message } = (error ?? {}) as {
+    code?: number
+    codeName?: string
+    message?: string
+  }
+  return (
+    code === 239 || // SnapshotTooOld
+    code === 246 || // SnapshotUnavailable
+    code === 251 || // NoSuchTransaction
+    code === 290 || // TransactionExceededLifetimeLimitSeconds
+    codeName === 'NoSuchTransaction' ||
+    codeName === 'TransactionExceededLifetimeLimitSeconds' ||
+    codeName === 'SnapshotTooOld' ||
+    /Transaction .* has been aborted/.test(message ?? '')
+  )
+}
+
+/**
+ * Whether the adapter runs real transactions. Payload's SQLite adapter (and
+ * Postgres or MongoDB with `transactionOptions: false`) returns no transaction
+ * id, so restores are not atomic and backups have no consistent snapshot.
+ */
+export const supportsTransactions = (payload: Payload): boolean =>
+  // Payload's `defaultBeginTransaction()` is an anonymous arrow that resolves to
+  // null; the adapters' real ones are named functions. Opening a transaction to
+  // find out would block other writers on SQLite.
+  typeof payload.db.beginTransaction === 'function' && payload.db.beginTransaction.name !== ''
+
+/**
+ * Starts a read-only transaction that sees the database as it was at one
+ * instant, so a backup is consistent even while editors keep working:
+ *
+ * - Postgres: REPEATABLE READ, READ ONLY
+ * - MongoDB: a transaction with snapshot read concern (at most 60 seconds)
+ *
+ * Returns undefined when there is no such transaction. That includes SQLite:
+ * Payload's SQLite transactions always take the write lock (BEGIN IMMEDIATE),
+ * which would block every editor until the backup ends.
+ */
+export const beginReadSnapshot = async (payload: Payload): Promise<string | undefined> => {
+  const kind = getDatabaseKind(payload)
+  if (!supportsTransactions(payload) || (kind !== 'postgres' && kind !== 'mongodb')) {
+    return undefined
+  }
+  const options =
+    kind === 'postgres'
+      ? { accessMode: 'read only', isolationLevel: 'repeatable read' }
+      : { readConcern: { level: 'snapshot' } }
+  const id = await payload.db.beginTransaction(options as never)
+  return id ? String(id) : undefined
+}
+
 const quoteIdent = (identifier: string) => `"${identifier.replace(/"/g, '""')}"`
 const quoteLiteral = (value: string) => `'${value.replace(/'/g, "''")}'`
 

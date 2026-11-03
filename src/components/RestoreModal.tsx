@@ -16,6 +16,11 @@ type Props = {
   /** Shown above the confirmation, e.g. what was just imported. */
   intro?: React.ReactNode
   modalSlug: string
+  /**
+   * The archive isn't signed by this site (imported, found in storage, or made
+   * by an older version). The user must confirm they trust where it came from.
+   */
+  unverified?: boolean
   warnings?: string[]
 }
 
@@ -31,14 +36,20 @@ export const RestoreModal = ({
   heading = 'Restore this backup?',
   intro,
   modalSlug,
+  unverified = false,
   warnings = [],
 }: Props) => {
   const { config } = useConfig()
   const [typed, setTyped] = useState('')
+  const [trusted, setTrusted] = useState(false)
 
   const restore = async () => {
     if (typed.trim() !== RESTORE_CONFIRMATION) {
       toast.error(`Type ${RESTORE_CONFIRMATION} to confirm the restore.`)
+      return
+    }
+    if (unverified && !trusted) {
+      toast.error('Confirm that you trust where this backup came from.')
       return
     }
     const pending = toast.loading('Restoring backup… do not close this page.')
@@ -46,7 +57,10 @@ export const RestoreModal = ({
       const response = await fetch(
         formatAdminURL({ apiRoute: config.routes.api, path: `/${backupsSlug}/${id}/restore` }),
         {
-          body: JSON.stringify({ confirm: RESTORE_CONFIRMATION }),
+          body: JSON.stringify({
+            allowUnverified: unverified && trusted,
+            confirm: RESTORE_CONFIRMATION,
+          }),
           credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
           method: 'POST',
@@ -61,6 +75,7 @@ export const RestoreModal = ({
       toast.error(`Restore failed: ${(error as Error).message}`, { id: pending })
     } finally {
       setTyped('')
+      setTrusted(false)
     }
   }
 
@@ -81,6 +96,23 @@ export const RestoreModal = ({
             <strong>all</strong> documents, globals, users and uploaded files with the content of
             the backup. A backup of the current state is taken first, unless that was turned off.
           </p>
+          {unverified && (
+            <label style={{ alignItems: 'flex-start', display: 'flex', gap: 8 }}>
+              <input
+                aria-label="I trust where this backup came from"
+                checked={trusted}
+                onChange={(event) => setTrusted(event.target.checked)}
+                style={{ marginTop: 4 }}
+                type="checkbox"
+              />
+              <span>
+                This backup is <strong>not signed by this site</strong>, so it can&apos;t be
+                verified: it was made by another site, by an older plugin version, or changed by
+                someone else. It replaces every user account too. I trust where this file came
+                from.
+              </span>
+            </label>
+          )}
           <label style={{ display: 'grid', gap: 4 }}>
             <span>
               Type <code>{RESTORE_CONFIRMATION}</code> to restore now.
@@ -101,7 +133,10 @@ export const RestoreModal = ({
       confirmLabel="Restore now"
       heading={heading}
       modalSlug={modalSlug}
-      onCancel={() => setTyped('')}
+      onCancel={() => {
+        setTyped('')
+        setTrusted(false)
+      }}
       onConfirm={restore}
     />
   )

@@ -1,27 +1,31 @@
 import type { Payload, PayloadRequest, TypedUser, Where } from 'payload'
 
-import crypto from 'crypto'
-import fs from 'fs'
 import fsp from 'fs/promises'
 import path from 'path'
 import { createLocalReq } from 'payload'
-import { pipeline } from 'stream/promises'
 import * as tar from 'tar'
 
 import type {
   BackupFrequency,
   BackupManifest,
+  BackupRecord,
   BackupType,
   SanitizedBackupPluginConfig,
 } from '../types.js'
 
 import { createBackupFilename } from '../utilities/filename.js'
 import { getPackageVersions } from '../utilities/versions.js'
+import { notify } from './callbacks.js'
+import { beginReadSnapshot, getDatabaseKind, isTransactionTimeout } from './database.js'
 import { getBackupCollections, getBackupGlobals, getMediaCollections } from './entities.js'
+import { encryptFile, hashArchiveContents, sha256File, signManifest } from './integrity.js'
 import { withLock } from './lock.js'
 import { copyFileToArchive, getArchiveMediaPath, getDocumentFiles } from './media.js'
 import { createNdjsonWriter } from './ndjson.js'
 import { applyRetention } from './retention.js'
+
+export type { BackupRecord }
+export { sha256File }
 
 export type CreateBackupArgs = {
   /** For scheduled backups: which schedules (daily, weekly, monthly) this backup counts for. */
@@ -36,15 +40,6 @@ export type CreateBackupArgs = {
   user?: null | TypedUser
 }
 
-export type BackupRecord = {
-  [key: string]: unknown
-  checksum?: null | string
-  filename: string
-  id: number | string
-  includesMedia?: boolean | null
-  status: string
-}
-
 /** How a user is shown in the `createdBy` column. */
 export const describeUser = (user?: null | TypedUser): string | undefined => {
   if (!user) {
@@ -52,12 +47,6 @@ export const describeUser = (user?: null | TypedUser): string | undefined => {
   }
   const email = (user as { email?: unknown }).email
   return typeof email === 'string' ? email : String(user.id)
-}
-
-export const sha256File = async (filePath: string): Promise<string> => {
-  const hash = crypto.createHash('sha256')
-  await pipeline(fs.createReadStream(filePath), hash)
-  return hash.digest('hex')
 }
 
 type Row = Record<string, unknown>
@@ -117,6 +106,10 @@ const afterVersion = (last: Row): Where => ({
  * hashes, are kept. Documents keep their ids, so relationships survive a
  * restore. Restore into the same database engine the backup was taken from:
  * MongoDB ids and SQL ids are not interchangeable.
+ *
+ * `req` should carry a read snapshot (see `beginReadSnapshot`), so all
+ * collections are read as of the same instant. The manifest lists the SHA-256
+ * of every file and is signed with the site's signing key.
  */
 export const writeBackupContents = async ({
   dir,
@@ -124,12 +117,15 @@ export const writeBackupContents = async ({
   options,
   payload,
   req,
+  snapshot,
 }: {
   dir: string
   includeMedia: boolean
   options: SanitizedBackupPluginConfig
   payload: Payload
   req: PayloadRequest
+  /** Whether `req` reads from one consistent snapshot. */
+  snapshot: boolean
 }): Promise<BackupManifest> => {
   const { payloadVersion, pluginVersion } = getPackageVersions()
   const manifest: BackupManifest = {
@@ -141,6 +137,7 @@ export const writeBackupContents = async ({
     media: [],
     payloadVersion,
     pluginVersion,
+    snapshot,
   }
 
   for (const folder of ['collections', 'versions', 'globals', 'global-versions', 'media']) {
@@ -275,9 +272,78 @@ export const writeBackupContents = async ({
     manifest.globals.push({ slug, exists, versions })
   }
 
+  manifest.migrations = await readMigrationNames(payload, req)
+  manifest.checksums = await hashArchiveContents(dir)
+  manifest.signature = signManifest(manifest, payload, options)
   await fsp.writeFile(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2))
 
   return manifest
+}
+
+/** Migrations that had run, so a restore can tell when the schema has changed since. */
+const readMigrationNames = async (payload: Payload, req: PayloadRequest): Promise<string[] | undefined> => {
+  if (!payload.collections['payload-migrations']) {
+    return undefined
+  }
+  try {
+    const { docs } = await payload.db.find({
+      collection: 'payload-migrations',
+      limit: 0,
+      pagination: false,
+      req,
+      sort: 'name',
+    })
+    return docs
+      .map((doc) => (doc as { name?: unknown }).name)
+      .filter((name): name is string => typeof name === 'string' && name !== 'dev')
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Writes the archive folder from one read snapshot. MongoDB ends a snapshot
+ * after 60 seconds; for databases too large for that, the backup is read again
+ * without one and the manifest says so.
+ */
+const writeFromSnapshot = async ({
+  dir,
+  includeMedia,
+  options,
+  payload,
+  user,
+}: {
+  dir: string
+  includeMedia: boolean
+  options: SanitizedBackupPluginConfig
+  payload: Payload
+  user?: null | TypedUser
+}): Promise<BackupManifest> => {
+  const req = await createLocalReq({ user: user ?? undefined }, payload)
+  const transactionID = await beginReadSnapshot(payload)
+
+  if (!transactionID) {
+    // Said once per process at startup (see warnAboutSetup); the manifest records it.
+    return writeBackupContents({ dir, includeMedia, options, payload, req, snapshot: false })
+  }
+
+  req.transactionID = transactionID
+  try {
+    const manifest = await writeBackupContents({ dir, includeMedia, options, payload, req, snapshot: true })
+    await payload.db.commitTransaction(transactionID)
+    return manifest
+  } catch (error) {
+    await payload.db.rollbackTransaction(transactionID).catch(() => undefined)
+    if (getDatabaseKind(payload) !== 'mongodb' || !isTransactionTimeout(error)) {
+      throw error
+    }
+    payload.logger.warn(
+      '[payload-plugin-backup] MongoDB ended the backup snapshot after 60 seconds (large database). Reading the backup again without a snapshot; documents changed meanwhile may not match each other.',
+    )
+    await fsp.rm(dir, { force: true, recursive: true })
+    const plainReq = await createLocalReq({ user: user ?? undefined }, payload)
+    return writeBackupContents({ dir, includeMedia, options, payload, req: plainReq, snapshot: false })
+  }
 }
 
 /**
@@ -287,7 +353,7 @@ export const writeBackupContents = async ({
  * Throws a 409 APIError while another backup or restore is running.
  */
 export const createBackup = (args: CreateBackupArgs): Promise<BackupRecord> =>
-  withLock('backup', () => takeBackup(args))
+  withLock({ options: args.options, payload: args.payload, task: 'backup' }, () => takeBackup(args))
 
 /** `createBackup` without the lock, for the safety backup a restore takes while holding it. */
 export const takeBackup = async ({
@@ -299,7 +365,8 @@ export const takeBackup = async ({
   payload,
   user,
 }: CreateBackupArgs): Promise<BackupRecord> => {
-  const filename = createBackupFilename(now)
+  const encrypted = Boolean(options.encryption)
+  const filename = createBackupFilename(now, { encrypted })
   const startedAt = now.toISOString()
   const withMedia = includeMedia && options.media.enabled
 
@@ -322,18 +389,28 @@ export const takeBackup = async ({
   const workDir = await fsp.mkdtemp(path.join(options.tempDir, 'payload-backup-'))
 
   try {
-    const req = await createLocalReq({ user: user ?? undefined }, payload)
     const dataDir = path.join(workDir, 'data')
-    const manifest = await writeBackupContents({
+    const manifest = await writeFromSnapshot({
       dir: dataDir,
       includeMedia: withMedia,
       options,
       payload,
-      req,
+      user,
     })
 
+    // Local media files are symlinked into the folder (see copyFileToArchive);
+    // `follow` packs the files themselves.
+    const tarPath = path.join(workDir, 'archive.tar.gz')
+    await tar.create({ cwd: dataDir, file: tarPath, follow: true, gzip: true, portable: true }, ['.'])
+    await fsp.rm(dataDir, { force: true, recursive: true })
+
     const archivePath = path.join(workDir, filename)
-    await tar.create({ cwd: dataDir, file: archivePath, gzip: true, portable: true }, ['.'])
+    if (options.encryption) {
+      await encryptFile({ input: tarPath, output: archivePath, secret: options.encryption.key })
+      await fsp.rm(tarPath, { force: true })
+    } else {
+      await fsp.rename(tarPath, archivePath)
+    }
 
     const { size } = await fsp.stat(archivePath)
     const checksum = await sha256File(archivePath)
@@ -346,9 +423,12 @@ export const takeBackup = async ({
         checksum,
         completedAt: new Date().toISOString(),
         documents: manifest.collections.reduce((sum, { count }) => sum + count, 0),
+        encrypted,
         files: manifest.media.reduce((sum, { files }) => sum + files, 0),
-        manifest,
+        manifest: { ...manifest, checksums: undefined },
+        signed: true,
         size,
+        snapshot: manifest.snapshot,
         status: 'completed',
       },
       overrideAccess: true,
@@ -359,20 +439,26 @@ export const takeBackup = async ({
     await applyRetention({ options, payload }).catch((error: unknown) => {
       payload.logger.error({ err: error, msg: '[payload-plugin-backup] Retention cleanup failed' })
     })
+    await notify(payload, 'afterBackup', () => options.afterBackup?.({ backup: completed, payload }))
 
     return completed
   } catch (error) {
     payload.logger.error({ err: error, msg: `[payload-plugin-backup] Backup ${filename} failed` })
-    await payload.update({
-      id: record.id,
-      collection: options.slug,
-      data: {
-        completedAt: new Date().toISOString(),
-        error: error instanceof Error ? error.message : String(error),
-        status: 'failed',
-      },
-      overrideAccess: true,
-    })
+    const failed = (await payload
+      .update({
+        id: record.id,
+        collection: options.slug,
+        data: {
+          completedAt: new Date().toISOString(),
+          error: error instanceof Error ? error.message : String(error),
+          status: 'failed',
+        },
+        overrideAccess: true,
+      })
+      .catch(() => record)) as unknown as BackupRecord
+    await notify(payload, 'afterBackupFailed', () =>
+      options.afterBackupFailed?.({ backup: failed, error, payload }),
+    )
     throw error
   } finally {
     await fsp.rm(workDir, { force: true, recursive: true })

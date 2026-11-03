@@ -5,7 +5,7 @@ import fs from 'fs'
 
 import type { BackupStorageAdapter } from '../types.js'
 
-import { assertSafeFilename } from '../utilities/filename.js'
+import { assertSafeFilename, isArchiveFilename } from '../utilities/filename.js'
 
 export type S3StorageAdapterArgs = {
   bucket: string
@@ -84,7 +84,7 @@ export const s3StorageAdapter = ({
         for (const object of page.Contents ?? []) {
           const filename = object.Key?.slice(cleanPrefix ? cleanPrefix.length + 1 : 0)
           // Only archives directly under the prefix, not in sub-folders.
-          if (filename && !filename.includes('/') && filename.endsWith('.tar.gz')) {
+          if (filename && !filename.includes('/') && isArchiveFilename(filename)) {
             files.push({ filename, size: object.Size })
           }
         }
@@ -97,7 +97,7 @@ export const s3StorageAdapter = ({
       const params = {
         Body: fs.createReadStream(filePath),
         Bucket: bucket,
-        ContentType: 'application/gzip',
+        ContentType: filename.endsWith('.enc') ? 'application/octet-stream' : 'application/gzip',
         Key: key(filename),
       }
 

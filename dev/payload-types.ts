@@ -72,6 +72,7 @@ export interface Config {
     categories: Category;
     posts: Post;
     backups: Backup;
+    'backups-lock': BackupsLock;
     'payload-kv': PayloadKv;
     'payload-locked-documents': PayloadLockedDocument;
     'payload-preferences': PayloadPreference;
@@ -84,6 +85,7 @@ export interface Config {
     categories: CategoriesSelect<false> | CategoriesSelect<true>;
     posts: PostsSelect<false> | PostsSelect<true>;
     backups: BackupsSelect<false> | BackupsSelect<true>;
+    'backups-lock': BackupsLockSelect<false> | BackupsLockSelect<true>;
     'payload-kv': PayloadKvSelect<false> | PayloadKvSelect<true>;
     'payload-locked-documents': PayloadLockedDocumentsSelect<false> | PayloadLockedDocumentsSelect<true>;
     'payload-preferences': PayloadPreferencesSelect<false> | PayloadPreferencesSelect<true>;
@@ -276,7 +278,32 @@ export interface Backup {
     | number
     | boolean
     | null;
+  /**
+   * Result of the last check of this backup (Verify).
+   */
+  verification?:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
   includesMedia?: boolean | null;
+  /**
+   * The archive carries a valid signature of this site, so it was not changed or forged.
+   */
+  signed?: boolean | null;
+  encrypted?: boolean | null;
+  /**
+   * Every document was read from one consistent snapshot of the database.
+   */
+  snapshot?: boolean | null;
+  /**
+   * Passed the last verification (downloaded, unpacked and checked).
+   */
+  verified?: boolean | null;
   storage?: string | null;
   /**
    * Name of the uploaded file.
@@ -286,12 +313,24 @@ export interface Backup {
   startedAt?: string | null;
   completedAt?: string | null;
   restoredAt?: string | null;
+  verifiedAt?: string | null;
   /**
    * SHA-256 of the archive.
    */
   checksum?: string | null;
   updatedAt: string;
   createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "backups-lock".
+ */
+export interface BackupsLock {
+  id: string;
+  task?: string | null;
+  owner?: string | null;
+  startedAt?: number | null;
+  heartbeatAt?: number | null;
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
@@ -490,16 +529,33 @@ export interface BackupsSelect<T extends boolean = true> {
   files?: T;
   error?: T;
   manifest?: T;
+  verification?: T;
   includesMedia?: T;
+  signed?: T;
+  encrypted?: T;
+  snapshot?: T;
+  verified?: T;
   storage?: T;
   importedFrom?: T;
   createdBy?: T;
   startedAt?: T;
   completedAt?: T;
   restoredAt?: T;
+  verifiedAt?: T;
   checksum?: T;
   updatedAt?: T;
   createdAt?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "backups-lock_select".
+ */
+export interface BackupsLockSelect<T extends boolean = true> {
+  id?: T;
+  task?: T;
+  owner?: T;
+  startedAt?: T;
+  heartbeatAt?: T;
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
@@ -571,6 +627,10 @@ export interface BackupSetting {
   timezone: string;
   includeMedia?: boolean | null;
   /**
+   * Download and check every scheduled backup right after it is stored, so a broken backup is noticed the same day. Takes about as long again as the backup itself.
+   */
+  verify?: boolean | null;
+  /**
    * A backup every day.
    */
   daily?: {
@@ -628,6 +688,7 @@ export interface BackupSettingsSelect<T extends boolean = true> {
   time?: T;
   timezone?: T;
   includeMedia?: T;
+  verify?: T;
   daily?:
     | T
     | {

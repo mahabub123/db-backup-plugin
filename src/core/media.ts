@@ -62,10 +62,12 @@ type UploadHandler = (
 ) => Promise<Response | void> | Response | void
 
 /**
- * Copies one file of an upload document into the archive folder.
- * Local files are copied from the collection's `staticDir`; files handled by a
- * storage adapter (S3, R2, Azure, GCS, Vercel Blob, ...) are streamed through
- * the adapter's static handler, the same way Payload serves them.
+ * Puts one file of an upload document into the archive folder.
+ * Local files are symlinked from the collection's `staticDir` (the archive is
+ * packed with `follow`, so no second copy of every upload is needed on disk);
+ * where symlinks aren't allowed they are copied. Files handled by a storage
+ * adapter (S3, R2, Azure, GCS, Vercel Blob, ...) are streamed through the
+ * adapter's static handler, the same way Payload serves them.
  *
  * @returns false when the file could not be found
  */
@@ -85,9 +87,16 @@ export const copyFileToArchive = async ({
   await fsp.mkdir(path.dirname(destination), { recursive: true })
 
   if (!collection.upload.disableLocalStorage) {
+    const source = resolveInside(getStaticDir(collection), file.filename)
     try {
-      await fsp.copyFile(resolveInside(getStaticDir(collection), file.filename), destination)
-      return true
+      if ((await fsp.stat(source)).isFile()) {
+        try {
+          await fsp.symlink(source, destination)
+        } catch {
+          await fsp.copyFile(source, destination)
+        }
+        return true
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw error

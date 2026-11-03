@@ -9,10 +9,12 @@ import type { BackupRecord } from '../core/createBackup.js'
 import type { SanitizedBackupPluginConfig } from '../types.js'
 
 import { createBackup } from '../core/createBackup.js'
+import { getBackupHealth } from '../core/health.js'
 import { importBackup, syncFromStorage } from '../core/importBackup.js'
 import { restoreBackup } from '../core/restoreBackup.js'
 import { runScheduledBackups } from '../core/schedule.js'
 import { assertSameStorage } from '../core/storageCheck.js'
+import { verifyBackup } from '../core/verify.js'
 
 /** Typed into the restore dialog; required by the API so a restore is never accidental. */
 export const RESTORE_CONFIRMATION = 'RESTORE'
@@ -123,6 +125,19 @@ export const createBackupEndpoints = (options: SanitizedBackupPluginConfig): End
     path: '/cron',
   },
   {
+    // GET /api/backups/health  (Authorization: Bearer <cronSecret>, or a signed-in admin)
+    // 200 while scheduled backups are on time, 503 when one is late or failing.
+    handler: async (req) => {
+      if (!hasCronSecret(req, options.schedule.cronSecret) && !(await options.access({ req }))) {
+        return json(req, { errors: [{ message: 'Invalid cron secret.' }] }, 401)
+      }
+      const health = await getBackupHealth({ options, payload: req.payload })
+      return json(req, health, health.ok ? 200 : 503)
+    },
+    method: 'get',
+    path: '/health',
+  },
+  {
     // POST /api/backups/sync  -> adds archives found in storage to the list
     handler: withAccess(options, async (req) => {
       const result = await syncFromStorage({ options, payload: req.payload, user: req.user })
@@ -145,7 +160,10 @@ export const createBackupEndpoints = (options: SanitizedBackupPluginConfig): End
       assertSameStorage(backup, options)
       const stream = await options.storage.download({ filename: backup.filename })
       const headers = headersWithCors({ headers: new Headers(), req })
-      headers.set('Content-Type', 'application/gzip')
+      headers.set(
+        'Content-Type',
+        backup.filename.endsWith('.enc') ? 'application/octet-stream' : 'application/gzip',
+      )
       headers.set('Content-Disposition', `attachment; filename="${backup.filename}"`)
       if (typeof backup.size === 'number') {
         headers.set('Content-Length', String(backup.size))
@@ -156,7 +174,23 @@ export const createBackupEndpoints = (options: SanitizedBackupPluginConfig): End
     path: '/:id/download',
   },
   {
-    // POST /api/backups/:id/restore  { confirm: 'RESTORE' }
+    // POST /api/backups/:id/verify  -> downloads the backup and checks it can be restored
+    handler: withAccess(options, async (req) => {
+      const backup = await getRecord(req, options)
+      if (!backup || backup.status !== 'completed') {
+        return json(req, { errors: [{ message: 'Backup not found.' }] }, 404)
+      }
+      const result = await verifyBackup({ id: backup.id, options, payload: req.payload })
+      return json(req, {
+        message: result.ok ? 'The backup is complete and can be restored.' : 'The backup has problems.',
+        verification: result,
+      })
+    }),
+    method: 'post',
+    path: '/:id/verify',
+  },
+  {
+    // POST /api/backups/:id/restore  { confirm: 'RESTORE', allowUnverified?: true }
     handler: withAccess(options, async (req) => {
       const body = await readJSON(req)
       if (body.confirm !== RESTORE_CONFIRMATION) {
@@ -172,6 +206,7 @@ export const createBackupEndpoints = (options: SanitizedBackupPluginConfig): End
       }
       const result = await restoreBackup({
         id: backup.id,
+        allowUnverified: body.allowUnverified === true,
         options,
         payload: req.payload,
         user: req.user,

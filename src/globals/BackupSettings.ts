@@ -97,6 +97,17 @@ export const createBackupSettingsGlobal = ({
         ],
       },
       {
+        name: 'verify',
+        type: 'checkbox',
+        admin: {
+          condition: (data) => Boolean(data?.enabled),
+          description:
+            'Download and check every scheduled backup right after it is stored, so a broken backup is noticed the same day. Takes about as long again as the backup itself.',
+        },
+        defaultValue: defaults.verify,
+        label: 'Verify each backup',
+      },
+      {
         name: 'daily',
         type: 'group',
         admin: {

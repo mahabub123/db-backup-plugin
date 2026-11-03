@@ -25,7 +25,8 @@ export const getBackupCollections = (
 ): SanitizedCollectionConfig[] =>
   filterBySlug(
     payload.config.collections.filter(
-      ({ slug }) => slug !== options.slug && !INTERNAL_COLLECTIONS.includes(slug),
+      ({ slug }) =>
+        slug !== options.slug && slug !== options.lockSlug && !INTERNAL_COLLECTIONS.includes(slug),
     ),
     options.collections,
   )

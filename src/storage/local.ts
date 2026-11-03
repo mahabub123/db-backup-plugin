@@ -4,7 +4,7 @@ import path from 'path'
 
 import type { BackupStorageAdapter } from '../types.js'
 
-import { assertSafeFilename } from '../utilities/filename.js'
+import { assertSafeFilename, isArchiveFilename } from '../utilities/filename.js'
 
 export type LocalStorageAdapterArgs = {
   /**
@@ -40,7 +40,7 @@ export const localStorageAdapter = ({
     list: async () => {
       const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => [])
       return entries
-        .filter((entry) => entry.isFile() && entry.name.endsWith('.tar.gz'))
+        .filter((entry) => entry.isFile() && isArchiveFilename(entry.name))
         .map((entry) => ({ filename: entry.name }))
     },
     upload: async ({ filename, filePath }) => {

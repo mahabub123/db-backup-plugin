@@ -26,6 +26,7 @@ type ImportedBackup = {
   files?: number
   id: number | string
   importedFrom?: string
+  signed?: boolean | null
   size?: number
   warnings: string[]
 }
@@ -198,6 +199,7 @@ export const BackupListActions = ({ backupsSlug = 'backups' }: { backupsSlug?: s
             </p>
           }
           modalSlug={IMPORT_MODAL}
+          unverified={!imported.signed}
           warnings={imported.warnings}
         />
       )}

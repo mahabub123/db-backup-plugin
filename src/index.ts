@@ -4,21 +4,33 @@ import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
-import type { BackupRecord } from './core/createBackup.js'
-import type { RestoreSummary } from './core/restoreBackup.js'
-import type { BackupPluginConfig, SanitizedBackupPluginConfig, ScheduleDefaults } from './types.js'
+import type { VerificationResult } from './core/verify.js'
+import type {
+  BackupPluginConfig,
+  BackupRecord,
+  RestoreSummary,
+  SanitizedBackupPluginConfig,
+  ScheduleDefaults,
+} from './types.js'
 
+import { createBackupLockCollection } from './collections/BackupLock.js'
 import { createBackupsCollection } from './collections/Backups.js'
 import { createBackup as runBackup } from './core/createBackup.js'
+import { getDatabaseKind, supportsTransactions } from './core/database.js'
+import { INTERNAL_COLLECTIONS } from './core/entities.js'
+import { getBackupHealth as runHealthCheck } from './core/health.js'
 import { restoreBackup as runRestore } from './core/restoreBackup.js'
+import { createGlobalRestoreGuard, createRestoreGuard } from './core/restoreGuard.js'
 import { startScheduler } from './core/scheduler.js'
+import { verifyBackup as runVerify } from './core/verify.js'
 import { createBackupSettingsGlobal } from './globals/BackupSettings.js'
 import { localStorageAdapter } from './storage/local.js'
 import { CUSTOM_KEY, getOptions } from './utilities/getOptions.js'
 
+export type { BackupHealth } from './core/health.js'
 export { RESTORE_CONTEXT_KEY } from './core/restoreBackup.js'
-export type { RestoreSummary } from './core/restoreBackup.js'
 export { runScheduledBackups } from './core/schedule.js'
+export type { VerificationResult } from './core/verify.js'
 export { localStorageAdapter } from './storage/local.js'
 export type { LocalStorageAdapterArgs } from './storage/local.js'
 export { r2StorageAdapter, s3StorageAdapter } from './storage/s3.js'
@@ -31,11 +43,11 @@ export type {
   BackupType,
   RestoreMediaFileArgs,
 } from './types.js'
-export type { BackupRecord }
+export type { BackupRecord, RestoreSummary }
 
 
 /**
- * `payload backup:export`, `backup:import` and `backup:sync`. The scripts sit next to
+ * `payload backup:export`, `backup:import`, `backup:sync` and `backup:verify`. The scripts sit next to
  * this file (src/*.ts while developing, dist/*.js once published).
  */
 const getBinScripts = () => {
@@ -47,6 +59,7 @@ const getBinScripts = () => {
       { key: 'backup:export', scriptPath: path.join(dir, `export${ext}`) },
       { key: 'backup:import', scriptPath: path.join(dir, `import${ext}`) },
       { key: 'backup:sync', scriptPath: path.join(dir, `sync${ext}`) },
+      { key: 'backup:verify', scriptPath: path.join(dir, `verify${ext}`) },
     ]
   } catch {
     // Bundled environments may not expose a file URL; the CLI doesn't run there.
@@ -61,6 +74,7 @@ const DEFAULT_SCHEDULE: ScheduleDefaults = {
   monthly: { day: 1, enabled: true, keep: 12 },
   time: '03:00',
   timezone: 'UTC',
+  verify: true,
   weekly: { day: 'sunday', enabled: true, keep: 4 },
 }
 
@@ -84,21 +98,37 @@ export const backupPlugin =
 
     const media = pluginOptions.media ?? true
     const schedule = pluginOptions.schedule || undefined
+    const slug = pluginOptions.slug ?? 'backups'
+    if (pluginOptions.encryption && !pluginOptions.encryption.key) {
+      throw new Error('payload-plugin-backup: `encryption.key` must not be empty.')
+    }
     const options: SanitizedBackupPluginConfig = {
-      slug: pluginOptions.slug ?? 'backups',
+      slug,
       access:
         pluginOptions.access ??
         (({ req }) => Boolean(req.user && req.user.collection === adminUserSlug)),
+      afterBackup: pluginOptions.afterBackup,
+      afterBackupFailed: pluginOptions.afterBackupFailed,
+      afterRestore: pluginOptions.afterRestore,
       batchSize: pluginOptions.batchSize ?? 500,
+      blockWritesDuringRestore: pluginOptions.blockWritesDuringRestore ?? true,
       collections: {
         exclude: (pluginOptions.collections?.exclude) ?? [],
         include: pluginOptions.collections?.include,
       },
+      encryption: pluginOptions.encryption
+        ? {
+            key: pluginOptions.encryption.key,
+            previousKeys: pluginOptions.encryption.previousKeys ?? [],
+          }
+        : undefined,
       globals: {
         exclude: (pluginOptions.globals?.exclude) ?? [],
         include: pluginOptions.globals?.include,
       },
+      healthGraceMinutes: Math.max(pluginOptions.healthGraceMinutes ?? 120, 0),
       includeVersions: pluginOptions.includeVersions ?? true,
+      lockSlug: `${slug}-lock`,
       media: {
         collections:
           typeof media === 'object' ? (media.collections) : undefined,
@@ -121,6 +151,10 @@ export const backupPlugin =
         runOnServer: schedule ? schedule.runOnServer !== false : true,
       },
       settingsSlug: pluginOptions.settingsSlug ?? 'backup-settings',
+      signing: {
+        previousSecrets: pluginOptions.signing?.previousSecrets ?? [],
+        secret: pluginOptions.signing?.secret,
+      },
       storage: pluginOptions.storage ?? localStorageAdapter(),
       tempDir: pluginOptions.tempDir ?? os.tmpdir(),
       useTransaction: pluginOptions.useTransaction,
@@ -129,9 +163,37 @@ export const backupPlugin =
     // The collection and global are added even when disabled so the database
     // schema (and migrations) stay the same whether or not the plugin is on.
     const adminGroup = pluginOptions.adminGroup ?? 'System'
+
+    if (!disabled && options.blockWritesDuringRestore) {
+      // Pause writes to everything a restore replaces. Preferences stay
+      // writable so the admin panel keeps working while it waits.
+      const skip = new Set(['payload-preferences', ...INTERNAL_COLLECTIONS])
+      const collectionGuard = createRestoreGuard(options)
+      const globalGuard = createGlobalRestoreGuard(options)
+      config.collections = (config.collections ?? []).map((collection) =>
+        skip.has(collection.slug)
+          ? collection
+          : {
+              ...collection,
+              hooks: {
+                ...collection.hooks,
+                beforeOperation: [...(collection.hooks?.beforeOperation ?? []), collectionGuard],
+              },
+            },
+      )
+      config.globals = (config.globals ?? []).map((global) => ({
+        ...global,
+        hooks: {
+          ...global.hooks,
+          beforeChange: [...(global.hooks?.beforeChange ?? []), globalGuard],
+        },
+      }))
+    }
+
     config.collections = [
       ...(config.collections ?? []),
       createBackupsCollection({ adminGroup, disabled, options }),
+      createBackupLockCollection({ options }),
     ]
     config.globals = [
       ...(config.globals ?? []),
@@ -152,10 +214,35 @@ export const backupPlugin =
         await incomingOnInit(payload)
       }
       startScheduler(payload, options)
+      warnAboutSetup(payload, options)
     }
 
     return config
   }
+
+/** Startup warnings for setups that look fine but don't protect the site well. */
+const warnAboutSetup = (payload: Payload, options: SanitizedBackupPluginConfig) => {
+  try {
+    if (options.storage.name === 'local' && process.env.NODE_ENV === 'production') {
+      payload.logger.warn(
+        '[payload-plugin-backup] Backups are stored on this server\'s own disk; they are lost together with the server. Use s3StorageAdapter or r2StorageAdapter in production.',
+      )
+    }
+    const kind = getDatabaseKind(payload)
+    if (!supportsTransactions(payload)) {
+      payload.logger.warn(
+        `[payload-plugin-backup] The database adapter has no transactions, so a failing restore can leave the site half restored (the safety backup can undo it).${kind === 'sqlite' ? ' Set `transactionOptions: {}` in sqliteAdapter to make restores all-or-nothing.' : ''}`,
+      )
+    }
+    if (kind === 'sqlite' || kind === 'other' || !supportsTransactions(payload)) {
+      payload.logger.info(
+        '[payload-plugin-backup] Backups on this database are not read from one consistent snapshot: documents changed while a backup runs may not match each other. Take backups when the site is quiet (the schedule runs at night by default).',
+      )
+    }
+  } catch {
+    // Warnings only.
+  }
+}
 
 /**
  * Takes a backup from your own code (scripts, hooks, custom endpoints):
@@ -179,6 +266,21 @@ export const createBackup = (
 export const restoreBackup = (
   payload: Payload,
   id: number | string,
-  args: { user?: null | TypedUser } = {},
+  args: {
+    /** Restore an archive that isn't signed by this site. Only for archives you trust. */
+    allowUnverified?: boolean
+    user?: null | TypedUser
+  } = {},
 ): Promise<{ safetyBackup?: BackupRecord; summary: RestoreSummary }> =>
   runRestore({ ...args, id, options: getOptions(payload), payload })
+
+/**
+ * Downloads a backup and checks it can be restored, without changing the
+ * site. The result is saved on the backup.
+ */
+export const verifyBackup = (payload: Payload, id: number | string): Promise<VerificationResult> =>
+  runVerify({ id, options: getOptions(payload), payload })
+
+/** Whether scheduled backups are on time and healthy (what `GET /api/backups/health` returns). */
+export const getBackupHealth = (payload: Payload) =>
+  runHealthCheck({ options: getOptions(payload), payload })

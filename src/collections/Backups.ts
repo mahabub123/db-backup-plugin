@@ -158,10 +158,55 @@ export const createBackupsCollection = ({
       },
     },
     {
+      name: 'verification',
+      type: 'json',
+      admin: {
+        condition: (data) => Boolean(data?.verifiedAt),
+        description: 'Result of the last check of this backup (Verify).',
+        readOnly: true,
+      },
+    },
+    {
       name: 'includesMedia',
       type: 'checkbox',
       admin: { position: 'sidebar', readOnly: true },
       label: 'Includes media files',
+    },
+    {
+      name: 'signed',
+      type: 'checkbox',
+      admin: {
+        description: 'The archive carries a valid signature of this site, so it was not changed or forged.',
+        position: 'sidebar',
+        readOnly: true,
+      },
+      label: 'Signed by this site',
+    },
+    {
+      name: 'encrypted',
+      type: 'checkbox',
+      admin: { position: 'sidebar', readOnly: true },
+      label: 'Encrypted',
+    },
+    {
+      name: 'snapshot',
+      type: 'checkbox',
+      admin: {
+        description: 'Every document was read from one consistent snapshot of the database.',
+        position: 'sidebar',
+        readOnly: true,
+      },
+      label: 'Consistent snapshot',
+    },
+    {
+      name: 'verified',
+      type: 'checkbox',
+      admin: {
+        description: 'Passed the last verification (downloaded, unpacked and checked).',
+        position: 'sidebar',
+        readOnly: true,
+      },
+      index: true,
     },
     {
       name: 'storage',
@@ -183,7 +228,7 @@ export const createBackupsCollection = ({
       type: 'text',
       admin: { position: 'sidebar', readOnly: true },
     },
-    ...(['startedAt', 'completedAt', 'restoredAt'] as const).map((name) => ({
+    ...(['startedAt', 'completedAt', 'restoredAt', 'verifiedAt'] as const).map((name) => ({
       name,
       type: 'date' as const,
       admin: {

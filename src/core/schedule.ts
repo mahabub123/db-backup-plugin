@@ -1,10 +1,14 @@
 import type { Payload, Where } from 'payload'
 
+import { APIError } from 'payload'
+
 import type { BackupFrequency, SanitizedBackupPluginConfig } from '../types.js'
 import type { BackupRecord } from './createBackup.js'
 
 import { createBackup } from './createBackup.js'
-import { getRunningTask } from './lock.js'
+import { getActiveTask } from './lock.js'
+import { findNewestVerified } from './retention.js'
+import { verifyBackup } from './verify.js'
 
 export const FREQUENCIES: BackupFrequency[] = ['daily', 'weekly', 'monthly']
 
@@ -29,14 +33,13 @@ export type ScheduleSettings = {
   /** 24h clock, e.g. "03:00", in `timezone`. */
   time?: null | string
   timezone?: null | string
+  verify?: boolean | null
   weekly?: { day?: null | Weekday; enabled?: boolean | null; keep?: null | number } | null
 }
 
 const DAY = 24 * 60 * 60 * 1000
 /** Don't hammer a failing database or bucket: wait this long before retrying. */
 const RETRY_AFTER = 60 * 60 * 1000
-/** A backup still "running" after this long is assumed to have crashed. */
-export const STALE_RUNNING = 6 * 60 * 60 * 1000
 
 export const parseTime = (time?: null | string): { hour: number; minute: number } => {
   const match = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec((time ?? '').trim())
@@ -240,6 +243,11 @@ export const applyScheduleRetention = async ({
   })
 
   const keep = new Set<number | string>()
+  // Never delete the newest backup known to restore cleanly.
+  const verified = await findNewestVerified({ options, payload, where: { type: { equals: 'scheduled' } } })
+  if (verified) {
+    keep.add(verified.id)
+  }
   for (const frequency of FREQUENCIES) {
     const limit = Math.max(settings[frequency]?.keep ?? 0, 0)
     docs
@@ -285,23 +293,11 @@ export const runScheduledBackups = async ({
     return { deleted: 0, frequencies: [], reason: 'Automatic backups are turned off.' }
   }
 
-  const task = getRunningTask()
+  // A backup or restore holding a live lease, on this or another server.
+  // (Backups left "running" by a server that died are failed by the next lock.)
+  const task = await getActiveTask(payload, options)
   if (task) {
     return { deleted: 0, frequencies: [], reason: `A ${task} is in progress; checking again later.` }
-  }
-
-  const running = await findLatest(payload, options, { status: { equals: 'running' } })
-  if (running) {
-    if (now.getTime() - new Date(running.startedAt as string).getTime() < STALE_RUNNING) {
-      return { deleted: 0, frequencies: [], reason: 'Another backup is running.' }
-    }
-    // The server was stopped or crashed in the middle of that backup.
-    await payload.update({
-      id: running.id,
-      collection: options.slug,
-      data: { error: 'Interrupted before it could finish.', status: 'failed' },
-      overrideAccess: true,
-    })
   }
 
   const frequencies = await getDueFrequencies({ now, options, payload, settings })
@@ -310,14 +306,28 @@ export const runScheduledBackups = async ({
   }
 
   payload.logger.info(`[payload-plugin-backup] Starting scheduled ${frequencies.join(' + ')} backup.`)
-  const backup = await createBackup({
-    type: 'scheduled',
-    frequencies,
-    includeMedia: settings.includeMedia ?? true,
-    now,
-    options,
-    payload,
-  })
+  let backup: BackupRecord
+  try {
+    backup = await createBackup({
+      type: 'scheduled',
+      frequencies,
+      includeMedia: settings.includeMedia ?? true,
+      now,
+      options,
+      payload,
+    })
+  } catch (error) {
+    // Another server started a backup or restore a moment ago.
+    if (error instanceof APIError && error.status === 409) {
+      return { deleted: 0, frequencies: [], reason: error.message }
+    }
+    throw error
+  }
+
+  if (settings.verify) {
+    const verification = await verifyBackup({ id: backup.id, options, payload })
+    backup = { ...backup, verification, verified: verification.ok }
+  }
   const deleted = await applyScheduleRetention({ options, payload, settings })
 
   return { backup, deleted, frequencies }

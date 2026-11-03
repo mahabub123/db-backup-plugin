@@ -13,13 +13,26 @@ import {
 import { pipeline } from 'stream/promises'
 import * as tar from 'tar'
 
-import type { BackupManifest, SanitizedBackupPluginConfig } from '../types.js'
-import type { BackupRecord } from './createBackup.js'
+import type {
+  BackupManifest,
+  BackupRecord,
+  BackupType,
+  RestoreSummary,
+  SanitizedBackupPluginConfig,
+} from '../types.js'
 
-import { checkCompatibility } from './compatibility.js'
-import { sha256File, takeBackup } from './createBackup.js'
-import { deferForeignKeys, getDatabaseKind, resetSequences, restoreForeignKeys } from './database.js'
+import { notify } from './callbacks.js'
+import { checkCompatibility, checkMigrations } from './compatibility.js'
+import { takeBackup } from './createBackup.js'
+import {
+  deferForeignKeys,
+  getDatabaseKind,
+  isTransactionTimeout,
+  resetSequences,
+  restoreForeignKeys,
+} from './database.js'
 import { getBackupCollections, getBackupGlobals, getMediaCollections } from './entities.js'
+import { checkArchiveContents, isSignedBySite, openArchive, sha256File } from './integrity.js'
 import { withLock } from './lock.js'
 import {
   copyFileToStaticDir,
@@ -29,19 +42,15 @@ import {
   isLocalUploadCollection,
 } from './media.js'
 import { readNdjson } from './ndjson.js'
-import { STALE_RUNNING } from './schedule.js'
 import { assertSameStorage } from './storageCheck.js'
+
+export type { RestoreSummary }
 
 /** Set on `req.context` while a restore writes to the database. */
 export const RESTORE_CONTEXT_KEY = 'payloadPluginBackupRestore'
 
-export type RestoreSummary = {
-  collections: { count: number; slug: string; versions: number }[]
-  files: { restored: number; skipped: number }
-  globals: string[]
-  /** Collections/globals in the archive that no longer exist in this config. */
-  skipped: string[]
-}
+/** Backups this site made itself; their checksum in the database vouches for them. */
+const LOCAL_TYPES: BackupType[] = ['manual', 'pre-restore', 'scheduled']
 
 type StoredVersion = {
   autosave?: boolean
@@ -55,7 +64,7 @@ type StoredVersion = {
 
 const withoutID = ({ id: _id, ...rest }: Record<string, unknown>) => rest
 
-const readManifest = async (dir: string): Promise<BackupManifest> => {
+export const readManifest = async (dir: string): Promise<BackupManifest> => {
   const manifestPath = path.join(dir, 'manifest.json')
   if (!(await fileExists(manifestPath))) {
     throw new Error('This file is not a Payload backup: manifest.json is missing.')
@@ -82,10 +91,53 @@ const readRestorableManifest = async ({
   if (errors.length) {
     throw new APIError(errors.join(' '), 400)
   }
-  for (const warning of warnings) {
+  for (const warning of [...warnings, ...(await checkMigrations({ manifest, payload }))]) {
     payload.logger.warn(`[payload-plugin-backup] ${warning}`)
   }
   return manifest
+}
+
+/**
+ * Checks that an extracted archive is complete and unchanged, and that this
+ * site made it. An archive that isn't signed by this site (made elsewhere,
+ * before signing existed, or forged) is only restored with `allowUnverified`.
+ */
+export const assertTrustedArchive = async ({
+  allowUnverified,
+  backup,
+  dir,
+  manifest,
+  options,
+  payload,
+}: {
+  allowUnverified?: boolean
+  backup?: BackupRecord
+  dir: string
+  manifest: BackupManifest
+  options: SanitizedBackupPluginConfig
+  payload: Payload
+}): Promise<{ signed: boolean }> => {
+  if (manifest.checksums) {
+    const problems = await checkArchiveContents(dir, manifest.checksums)
+    if (problems.length) {
+      throw new APIError(
+        `The backup is damaged or was changed: ${problems.slice(0, 5).join(' ')}${problems.length > 5 ? ` (${problems.length - 5} more)` : ''}`,
+        400,
+      )
+    }
+  }
+
+  const signed = Boolean(manifest.checksums) && isSignedBySite(manifest, payload, options)
+  const vouchedFor = Boolean(
+    backup?.checksum && backup.type && LOCAL_TYPES.includes(backup.type),
+  )
+  if (!signed && !vouchedFor && !allowUnverified) {
+    throw new APIError(
+      'This backup is not signed by this site, so it cannot be verified: it was made by another site (or with another PAYLOAD_SECRET), by a plugin version before 1.2, or changed by someone else. Restore it only if you trust where it came from, by confirming that explicitly (allowUnverified).',
+      400,
+    )
+  }
+  return { signed }
 }
 
 const restoreDatabase = async ({
@@ -106,7 +158,7 @@ const restoreDatabase = async ({
 }): Promise<RestoreSummary> => {
   const summary: RestoreSummary = {
     collections: [],
-    files: { restored: 0, skipped: 0 },
+    files: { failed: [], restored: 0, skipped: 0 },
     globals: [],
     skipped: [],
   }
@@ -215,6 +267,11 @@ const restoreDatabase = async ({
   return summary
 }
 
+/**
+ * Writes the uploaded files back. Runs after the database commit, so one file
+ * that can't be written (full disk, bucket error) doesn't undo the restore:
+ * it is listed in `summary.files.failed` instead.
+ */
 const restoreMedia = async ({
   dir,
   options,
@@ -239,21 +296,28 @@ const restoreMedia = async ({
           continue
         }
 
-        if (isLocalUploadCollection(collection)) {
-          await copyFileToStaticDir({ collection, file, source })
-          summary.files.restored++
-        } else if (options.media.restoreFile) {
-          await options.media.restoreFile({
-            collection: collection.slug,
-            doc,
-            filename: file.filename,
-            filePath: source,
-            payload,
-            prefix: file.prefix,
+        try {
+          if (isLocalUploadCollection(collection)) {
+            await copyFileToStaticDir({ collection, file, source })
+            summary.files.restored++
+          } else if (options.media.restoreFile) {
+            await options.media.restoreFile({
+              collection: collection.slug,
+              doc,
+              filename: file.filename,
+              filePath: source,
+              payload,
+              prefix: file.prefix,
+            })
+            summary.files.restored++
+          } else {
+            summary.files.skipped++
+          }
+        } catch (error) {
+          summary.files.failed.push({
+            file: [collection.slug, file.prefix, file.filename].filter(Boolean).join('/'),
+            reason: error instanceof Error ? error.message : String(error),
           })
-          summary.files.restored++
-        } else {
-          summary.files.skipped++
         }
       }
     }
@@ -264,25 +328,11 @@ const restoreMedia = async ({
       `[payload-plugin-backup] ${summary.files.skipped} file(s) belong to upload collections with disableLocalStorage and were not restored. Provide \`media.restoreFile\` to upload them to your storage.`,
     )
   }
-}
-
-/**
- * MongoDB ends a transaction that runs longer than 60 seconds
- * (`transactionLifetimeLimitSeconds`); everything it wrote is discarded.
- */
-const isTransactionTimeout = (error: unknown): boolean => {
-  const { code, codeName, message } = (error ?? {}) as {
-    code?: number
-    codeName?: string
-    message?: string
+  if (summary.files.failed.length) {
+    payload.logger.error(
+      `[payload-plugin-backup] ${summary.files.failed.length} file(s) could not be restored, e.g. ${summary.files.failed[0].file}: ${summary.files.failed[0].reason}`,
+    )
   }
-  return (
-    code === 251 ||
-    code === 290 ||
-    codeName === 'NoSuchTransaction' ||
-    codeName === 'TransactionExceededLifetimeLimitSeconds' ||
-    /Transaction .* has been aborted/.test(message ?? '')
-  )
 }
 
 /**
@@ -316,6 +366,11 @@ export const restoreFromDirectory = async ({
       payload,
     )
     let open = await initTransaction(req)
+    if (!open) {
+      payload.logger.warn(
+        '[payload-plugin-backup] The database adapter has no transactions, so a failing restore can leave the site half restored (use the safety backup to undo it). On SQLite, set `transactionOptions: {}` in sqliteAdapter.',
+      )
+    }
     let writes = 0
     const afterWrite = async () => {
       if (mode === 'batches' && open && ++writes % options.batchSize === 0) {
@@ -365,7 +420,12 @@ export const restoreFromDirectory = async ({
   return summary
 }
 
-/** Downloads and unpacks an archive into a fresh temporary folder. */
+/**
+ * Unpacks a plain `.tar.gz` into a fresh folder. Only regular files and
+ * folders are unpacked: a symlink or hard link in an archive could otherwise
+ * make the restore read files from elsewhere on the server.
+ * node-tar also strips absolute paths and `..` segments.
+ */
 export const extractArchive = async ({
   archivePath,
   dir,
@@ -374,11 +434,52 @@ export const extractArchive = async ({
   dir: string
 }): Promise<void> => {
   await fsp.mkdir(dir, { recursive: true })
-  // node-tar strips absolute paths and `..` segments, so entries stay inside `dir`.
-  await tar.extract({ cwd: dir, file: archivePath, strict: true })
+  await tar.extract({
+    cwd: dir,
+    file: archivePath,
+    filter: (_path, entry) => {
+      const type = (entry as { type?: string }).type
+      return type === 'File' || type === 'OldFile' || type === 'Directory'
+    },
+    strict: true,
+  })
+}
+
+/**
+ * Downloads (when needed), checks, decrypts and unpacks a stored backup into
+ * `workDir/data`. Shared by restore and verify.
+ */
+export const unpackStoredBackup = async ({
+  backup,
+  options,
+  workDir,
+}: {
+  backup: BackupRecord
+  options: SanitizedBackupPluginConfig
+  workDir: string
+}): Promise<string> => {
+  const archivePath = path.join(workDir, 'archive')
+  await pipeline(
+    await options.storage.download({ filename: backup.filename }),
+    fs.createWriteStream(archivePath),
+  )
+
+  if (backup.checksum && (await sha256File(archivePath)) !== backup.checksum) {
+    throw new Error(`Backup ${backup.filename} is corrupted: its checksum does not match.`)
+  }
+
+  const { tarPath } = await openArchive({ archivePath, options })
+  const dataDir = path.join(workDir, 'data')
+  await extractArchive({ archivePath: tarPath, dir: dataDir })
+  // Free the disk space of the archive before the restore needs more.
+  await fsp.rm(archivePath, { force: true })
+  await fsp.rm(tarPath, { force: true })
+  return dataDir
 }
 
 export type RestoreBackupArgs = {
+  /** Restore an archive that isn't signed by this site. Only for archives you trust. */
+  allowUnverified?: boolean
   id: number | string
   options: SanitizedBackupPluginConfig
   payload: Payload
@@ -388,15 +489,16 @@ export type RestoreBackupArgs = {
 /**
  * Restores a stored backup. Unless `safetyBackupBeforeRestore` is turned off,
  * the current state is backed up first, so the restore can be undone.
- * Throws a 409 APIError while another backup or restore is running.
+ * Throws a 409 APIError while another backup or restore is running on any server.
  */
 export const restoreBackup = (
   args: RestoreBackupArgs,
 ): Promise<{ safetyBackup?: BackupRecord; summary: RestoreSummary }> =>
-  withLock('restore', () => runRestore(args))
+  withLock({ options: args.options, payload: args.payload, task: 'restore' }, () => runRestore(args))
 
 const runRestore = async ({
   id,
+  allowUnverified,
   options,
   payload,
   user,
@@ -413,47 +515,15 @@ const runRestore = async ({
   }
   assertSameStorage(backup, options)
 
-  // A backup running in another server process (e.g. a scheduled one) would
-  // capture a mix of old and restored content.
-  const {
-    docs: [running],
-  } = await payload.find({
-    collection: options.slug,
-    depth: 0,
-    limit: 1,
-    overrideAccess: true,
-    where: {
-      and: [
-        { status: { equals: 'running' } },
-        { startedAt: { greater_than: new Date(Date.now() - STALE_RUNNING).toISOString() } },
-      ],
-    },
-  })
-  if (running) {
-    throw new APIError(
-      `Backup ${String(running.filename)} is being taken right now. Restore when it has finished. If the server was restarted since it started, it was interrupted: delete it from the list and try again.`,
-      409,
-    )
-  }
-
   await fsp.mkdir(options.tempDir, { recursive: true })
   const workDir = await fsp.mkdtemp(path.join(options.tempDir, 'payload-restore-'))
 
+  let started = false
   try {
-    const archivePath = path.join(workDir, 'archive.tar.gz')
-    await pipeline(
-      await options.storage.download({ filename: backup.filename }),
-      fs.createWriteStream(archivePath),
-    )
-
-    if (backup.checksum && (await sha256File(archivePath)) !== backup.checksum) {
-      throw new Error(`Backup ${backup.filename} is corrupted: its checksum does not match.`)
-    }
-
-    const dataDir = path.join(workDir, 'data')
-    await extractArchive({ archivePath, dir: dataDir })
-    // Fail before the safety backup if the archive doesn't fit this site.
-    await readRestorableManifest({ dir: dataDir, options, payload })
+    const dataDir = await unpackStoredBackup({ backup, options, workDir })
+    // Fail before the safety backup if the archive doesn't fit this site or can't be trusted.
+    const manifest = await readRestorableManifest({ dir: dataDir, options, payload })
+    await assertTrustedArchive({ allowUnverified, backup, dir: dataDir, manifest, options, payload })
 
     const safetyBackup = options.safetyBackupBeforeRestore
       ? await takeBackup({
@@ -466,6 +536,7 @@ const runRestore = async ({
       : undefined
 
     payload.logger.info(`[payload-plugin-backup] Restoring ${backup.filename}...`)
+    started = true
     const summary = await restoreFromDirectory({ dir: dataDir, options, payload, user })
 
     await payload.update({
@@ -476,7 +547,14 @@ const runRestore = async ({
     })
 
     payload.logger.info(`[payload-plugin-backup] Restored ${backup.filename}.`)
+    await notify(payload, 'afterRestore', () => options.afterRestore?.({ backup, payload, summary }))
     return { safetyBackup, summary }
+  } catch (error) {
+    if (started) {
+      payload.logger.error({ err: error, msg: `[payload-plugin-backup] Restore of ${backup.filename} failed` })
+    }
+    await notify(payload, 'afterRestore', () => options.afterRestore?.({ backup, error, payload }))
+    throw error
   } finally {
     await fsp.rm(workDir, { force: true, recursive: true })
   }

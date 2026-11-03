@@ -20,6 +20,7 @@ if (!process.env.ROOT_DIR) {
 /**
  * DATABASE_ADAPTER=mongodb (default) | postgres | sqlite
  * In tests, MongoDB runs in memory; Postgres and SQLite use DATABASE_URL.
+ * SQLITE_TRANSACTIONS=1 turns on SQLite transactions (off in Payload by default).
  */
 const getDatabaseAdapter = async (): Promise<DatabaseAdapterObj> => {
   const adapter = process.env.DATABASE_ADAPTER || 'mongodb'
@@ -37,6 +38,7 @@ const getDatabaseAdapter = async (): Promise<DatabaseAdapterObj> => {
     return sqliteAdapter({
       client: { url: process.env.DATABASE_URL || 'file:./dev/payload.db' },
       push: true,
+      ...(process.env.SQLITE_TRANSACTIONS ? { transactionOptions: {} } : {}),
     })
   }
 

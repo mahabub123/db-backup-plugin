@@ -8,12 +8,17 @@ import { APIError } from 'payload'
 import { pipeline } from 'stream/promises'
 import * as tar from 'tar'
 
-import type { BackupManifest, BackupType, SanitizedBackupPluginConfig } from '../types.js'
-import type { BackupRecord } from './createBackup.js'
+import type {
+  BackupManifest,
+  BackupRecord,
+  BackupType,
+  SanitizedBackupPluginConfig,
+} from '../types.js'
 
 import { createBackupFilename } from '../utilities/filename.js'
-import { checkCompatibility, type Compatibility } from './compatibility.js'
-import { describeUser, sha256File } from './createBackup.js'
+import { checkCompatibility, checkMigrations, type Compatibility } from './compatibility.js'
+import { describeUser } from './createBackup.js'
+import { isSignedBySite, openArchive, sha256File } from './integrity.js'
 
 /**
  * Reads the manifest of an archive on disk and checks it can be restored on
@@ -29,18 +34,27 @@ const inspectArchive = async ({
   options: SanitizedBackupPluginConfig
   payload: Payload
   workDir: string
-}): Promise<{ manifest: BackupManifest } & Compatibility> => {
+}): Promise<{ encrypted: boolean; manifest: BackupManifest; signed: boolean } & Compatibility> => {
   const manifestDir = path.join(workDir, 'manifest')
   await fsp.mkdir(manifestDir, { recursive: true })
+  // Decryption errors (no key, wrong key, damaged file) are reported as they are.
+  const { encrypted, tarPath } = await openArchive({ archivePath, options }).catch((error: unknown) => {
+    throw new APIError((error as Error).message, 400)
+  })
   try {
     await tar.extract({
       cwd: manifestDir,
-      file: archivePath,
-      filter: (entry) => path.normalize(entry) === 'manifest.json',
+      file: tarPath,
+      filter: (entry, stat) =>
+        path.normalize(entry) === 'manifest.json' && (stat as { type?: string }).type === 'File',
       strict: true,
     })
   } catch {
     throw new APIError('The file is not a valid .tar.gz backup archive.', 400)
+  } finally {
+    if (tarPath !== archivePath) {
+      await fsp.rm(tarPath, { force: true })
+    }
   }
 
   let manifest: BackupManifest
@@ -52,26 +66,33 @@ const inspectArchive = async ({
     throw new APIError('The file is not a Payload backup: manifest.json is missing.', 400)
   }
 
-  return { manifest, ...checkCompatibility({ manifest, options, payload }) }
+  const signed = Boolean(manifest.checksums) && isSignedBySite(manifest, payload, options)
+  const { errors, warnings } = checkCompatibility({ manifest, options, payload })
+  warnings.push(...(await checkMigrations({ manifest, payload })))
+  return { encrypted, errors, manifest, signed, warnings }
 }
 
 /** Creates the backups-collection record for an archive that is already in storage. */
 const createRecord = async ({
   type,
   archivePath,
+  encrypted,
   filename,
   manifest,
   options,
   originalFilename,
   payload,
+  signed,
   user,
 }: {
   archivePath: string
+  encrypted: boolean
   filename: string
   manifest: BackupManifest
   options: SanitizedBackupPluginConfig
   originalFilename?: string
   payload: Payload
+  signed: boolean
   type: BackupType
   user?: null | TypedUser
 }): Promise<BackupRecord> => {
@@ -85,12 +106,15 @@ const createRecord = async ({
       completedAt: now,
       createdBy: describeUser(user),
       documents: manifest.collections.reduce((sum, { count }) => sum + count, 0),
+      encrypted,
       filename,
       files: manifest.media.reduce((sum, { files }) => sum + files, 0),
       importedFrom: originalFilename?.slice(0, 255),
       includesMedia: manifest.media.some(({ files }) => files > 0),
-      manifest,
+      manifest: { ...manifest, checksums: undefined },
+      signed,
       size,
+      snapshot: manifest.snapshot,
       // When the archive was made, not when it was found or imported.
       startedAt: manifest.createdAt ?? now,
       status: 'completed',
@@ -138,7 +162,7 @@ export const importBackup = async ({
     await pipeline(stream, fs.createWriteStream(archivePath))
 
     // Refuse archives that could never be restored here, before storing them.
-    const { errors, manifest, warnings } = await inspectArchive({
+    const { encrypted, errors, manifest, signed, warnings } = await inspectArchive({
       archivePath,
       options,
       payload,
@@ -147,19 +171,27 @@ export const importBackup = async ({
     if (errors.length) {
       throw new APIError(errors.join(' '), 400)
     }
+    if (!signed) {
+      warnings.push(
+        'This backup is not signed by this site (it was made elsewhere, by an older plugin version, or changed). Restoring it needs an extra confirmation.',
+      )
+    }
 
-    const filename = createBackupFilename()
+    // Stored as uploaded: an encrypted archive stays encrypted.
+    const filename = createBackupFilename(new Date(), { encrypted })
     const { size } = await fsp.stat(archivePath)
     await options.storage.upload({ filename, filePath: archivePath, size })
 
     const backup = await createRecord({
       type: 'imported',
       archivePath,
+      encrypted,
       filename,
       manifest,
       options,
       originalFilename,
       payload,
+      signed,
       user,
     })
     return { backup, warnings }
@@ -210,13 +242,33 @@ export const syncFromStorage = async ({
       const archivePath = path.join(workDir, 'archive.tar.gz')
       await pipeline(await options.storage.download({ filename }), fs.createWriteStream(archivePath))
       try {
-        const { errors, manifest } = await inspectArchive({ archivePath, options, payload, workDir })
+        const { encrypted, errors, manifest, signed } = await inspectArchive({
+          archivePath,
+          options,
+          payload,
+          workDir,
+        })
         if (errors.length) {
           result.skipped.push({ filename, reason: errors.join(' ') })
           return
         }
+        if (!signed) {
+          payload.logger.warn(
+            `[payload-plugin-backup] ${filename} in storage is not signed by this site; restoring it needs an extra confirmation.`,
+          )
+        }
         result.added.push(
-          await createRecord({ type: 'found', archivePath, filename, manifest, options, payload, user }),
+          await createRecord({
+            type: 'found',
+            archivePath,
+            encrypted,
+            filename,
+            manifest,
+            options,
+            payload,
+            signed,
+            user,
+          }),
         )
       } catch (error) {
         result.skipped.push({ filename, reason: (error as Error).message })
